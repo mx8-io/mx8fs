@@ -54,7 +54,7 @@ jobs:
 
       - name: Install python dependencies
         run: |
-          poetry install
+          poetry install --with dev
 
 
       - name: Update version in pyproject.toml
