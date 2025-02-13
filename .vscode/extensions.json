@@ -1,0 +1,25 @@
+{
+  "recommendations": [
+    "ms-python.black-formatter",
+    "ms-python.flake8",
+    "github.vscode-github-actions",
+    "github.vscode-pull-request-github",
+    "ms-python.isort",
+    "magicstack.magicpython",
+    "ms-python.vscode-pylance",
+    "twixes.pypi-assistant",
+    "ms-python.debugpy",
+    "kevinrose.vsc-python-indent",
+    "humao.rest-client",
+    "buenon.scratchpads",
+    "sonarsource.sonarlint-vscode",
+    "mikoz.autoflake-extension",
+    "boto3typed.boto3-ide",
+    "tamasfe.even-better-toml",
+    "grapecity.gc-excelviewer",
+    "bierner.markdown-preview-github-styles",
+    "ms-python.mypy-type-checker",
+    "mechatroner.rainbow-csv",
+    "alexcvzz.vscode-sqlite"
+  ]
+}

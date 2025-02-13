@@ -1,0 +1,5 @@
+coverage/lcov.info
+.coverage*
+.DS_Store
+__pycache__
+dist/

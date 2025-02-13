@@ -1,0 +1,247 @@
+"""
+AWS file IO functions
+
+Copyright (c) 2023-2025 MX8 Inc, all rights reserved.
+
+This software is confidential and proprietary information of MX8.
+You shall not disclose such Confidential Information and shall use it only
+in accordance with the terms of the agreement you entered into with MX8.
+"""
+
+import os
+from datetime import datetime
+from glob import glob
+from io import BytesIO
+from shutil import copyfile
+from typing import IO, Any, Dict, List, Literal, Tuple, cast
+
+import boto3
+from botocore.config import Config
+
+boto_config = Config(
+    max_pool_connections=int(os.getenv("BOTO_MAX_CONNECTIONS", 10)),
+    connect_timeout=float(os.getenv("BOTO_CONNECT_TIMEOUT", 10.0)),
+    read_timeout=float(os.getenv("BOTO_READ_TIMEOUT", 10.0)),
+    retries={
+        "total_max_attempts": int(os.getenv("BOTO_MAX_RETRIES", 5)),
+        "mode": cast(Literal["legacy", "standard", "adaptive"], os.getenv("BOTO_RETRY_MODE", "standard")),
+    },
+)
+
+s3_client = boto3.client(
+    service_name="s3",
+    config=boto_config,
+)
+
+
+def get_bucket_key(path: str) -> Tuple[str, str]:
+    """Get the bucket and key from a S3 path"""
+    path = path.replace("s3://", "")
+    bucket, key = path.split("/", 1)
+    return bucket, key
+
+
+def file_exists(file: str) -> bool:
+    """Check if a file exists on S3 or local storage"""
+    if file.startswith("s3://"):
+        bucket, key = get_bucket_key(file)
+        try:
+            s3_client.head_object(Bucket=bucket, Key=key)
+            return True
+        except s3_client.exceptions.ClientError:
+            return False
+
+    return os.path.exists(file)
+
+
+def read_file(file: str) -> str:
+    """Read a file from S3 or local storage with UTF-8 encoding"""
+    if file.startswith("s3://"):
+        bucket, key = get_bucket_key(file)
+        try:
+            return str(s3_client.get_object(Bucket=bucket, Key=key)["Body"].read().decode("utf-8"))
+        except s3_client.exceptions.NoSuchKey as exc:
+            raise FileNotFoundError(f"File {file} not found") from exc
+    else:
+        with open(file, mode="r", encoding="UTF-8") as file_io:
+            return file_io.read()
+
+
+def write_file(file: str, data: str) -> None:
+    """Write a file to S3 or local storage with UTF-8 encoding"""
+    if file.startswith("s3://"):
+        bucket, key = get_bucket_key(file)
+        s3_client.put_object(Bucket=bucket, Key=key, Body=data.encode("UTF-8"))
+    else:
+        os.makedirs(os.path.dirname(file), exist_ok=True)
+        with open(file, mode="w", encoding="UTF-8") as file_io:
+            file_io.write(data)
+
+
+def delete_file(file: str) -> None:
+    """Delete a file from S3 or local storage"""
+    if file.startswith("s3://"):
+        bucket, key = get_bucket_key(file)
+        s3_client.delete_object(Bucket=bucket, Key=key)
+    else:
+        try:
+            os.remove(file)
+        except FileNotFoundError:
+            # Ignore if the file does not exist for S3 consistency
+            pass
+
+
+def copy_file(src: str, dst: str) -> None:
+    """Copy a file from S3 or local storage"""
+    if src.startswith("s3://"):
+        src_bucket, src_key = get_bucket_key(src)
+        dst_bucket, dst_key = get_bucket_key(dst)
+
+        s3_client.copy_object(
+            Bucket=dst_bucket,
+            Key=dst_key,
+            CopySource={"Bucket": src_bucket, "Key": src_key},
+        )
+    else:
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        copyfile(src, dst)
+
+
+def move_file(src: str, dst: str) -> None:
+    """Move a file from S3 or local storage"""
+    copy_file(src, dst)
+    delete_file(src)
+
+
+def list_files(root_path: str, file_type: str, prefix: str = "") -> List[str]:
+    """Returns a list of files from S3 or local storage with the relevant suffix and optional prefix.
+
+    The prefix signficantly improves performance for S3 by reducing the number of objects listed.
+    """
+    if root_path.startswith("s3://"):
+        bucket, key = get_bucket_key(root_path)
+        key = key + "/" if not key.endswith("/") else key
+        continuation_token = None
+        files = []
+
+        while True:
+            boto_kwargs = {
+                "Bucket": bucket,
+                "Prefix": key + prefix,
+                "Delimiter": "/",
+            }
+
+            if continuation_token:
+                boto_kwargs["ContinuationToken"] = continuation_token
+
+            boto_response = s3_client.list_objects_v2(**boto_kwargs)
+
+            if "Contents" in boto_response:
+                files.extend(
+                    [
+                        obj["Key"].replace(key, "").replace(f".{file_type}", "")
+                        for obj in boto_response["Contents"]
+                        if obj["Key"].endswith(file_type)
+                    ]
+                )
+
+            if boto_response.get("IsTruncated"):  # There are more objects to list
+                continuation_token = boto_response.get("NextContinuationToken")
+            else:
+                break
+
+        return files
+
+    return [os.path.split(f)[1][: -len(file_type) - 1] for f in glob(os.path.join(root_path, f"{prefix}*.{file_type}"))]
+
+
+def most_recent_timestamp(root_path: str, file_type: str) -> float:
+    """Returns the most recent timestamp from S3 or local storage with the suffix"""
+    if root_path.startswith("s3://"):
+        bucket, key = get_bucket_key(root_path)
+        boto_response = s3_client.list_objects_v2(Bucket=bucket, Prefix=key, Delimiter="/")
+        if "Contents" not in boto_response:
+            return 0
+
+        return max(
+            [obj["LastModified"] for obj in boto_response["Contents"] if obj["Key"].endswith(file_type)],
+            default=datetime(1970, 1, 1),
+        ).timestamp()
+
+    return max(
+        [os.path.getmtime(f) for f in glob(os.path.join(root_path, f"*.{file_type}"))],
+        default=0,
+    )
+
+
+def get_public_url(file: str, expires_in: int = 3600) -> str:
+    """Get a signed URL for a file on S3"""
+
+    if file.startswith("s3://"):
+        bucket, key = get_bucket_key(file)
+        presigned_url = s3_client.generate_presigned_url(
+            ClientMethod="get_object",
+            Params={"Bucket": bucket, "Key": key},
+            ExpiresIn=expires_in,
+        )
+
+        return str(presigned_url)
+
+    return file
+
+
+class BinaryFileHandler:
+    """File handler for S3 or local storage"""
+
+    _buffer: IO[Any]
+
+    def __init__(self, path: str, mode: str = "rb", content_type: str | None = None):
+        """
+        Creates the class, emulating the file object.
+
+        For S3, returns a BytesIO object for writing, and downloads the file
+        For local storage, returns a file object
+        """
+
+        if mode not in ["rb", "wb"]:
+            raise NotImplementedError(f"mode {mode} is not supported")
+
+        self.path = path
+        self.mode = mode
+        self.content_type = content_type
+        self.is_s3 = path.startswith("s3://")
+
+        if self.is_s3:
+            self._buffer = BytesIO()
+        else:
+            os.makedirs(os.path.dirname(self.path), exist_ok=True)
+            self._buffer = open(  # pylint: disable=consider-using-with
+                self.path, self.mode, encoding="UTF-8" if self.mode == "w" else None
+            )
+
+    def __enter__(self) -> BytesIO | IO:
+        """Read from S3 and open the stream"""
+        if self.is_s3:
+            bucket, key = get_bucket_key(self.path)
+            if self.mode == "rb":
+                # Download the file from S3 to the stream
+                try:
+                    s3_client.download_fileobj(Bucket=bucket, Key=key, Fileobj=self._buffer)
+                except s3_client.exceptions.ClientError as exc:
+                    raise FileNotFoundError(f"File {self.path} not found") from exc
+                self._buffer.seek(0)
+
+        return self._buffer
+
+    def __exit__(self, *_: List[Any], **__: Dict[str, Any]) -> None:
+        """Write to S3 or local storage and close the stream"""
+        if self.is_s3 and self.mode == "wb":
+            self._buffer.seek(0)
+            bucket, key = get_bucket_key(self.path)
+            s3_client.upload_fileobj(
+                Fileobj=self._buffer,
+                Bucket=bucket,
+                Key=key,
+                ExtraArgs=({"ContentType": self.content_type} if self.content_type else None),
+            )
+        self._buffer.close()

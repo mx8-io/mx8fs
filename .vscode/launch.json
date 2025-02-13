@@ -1,0 +1,30 @@
+{
+  // Use IntelliSense to learn about possible attributes.
+  // Hover to view descriptions of existing attributes.
+  // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "File System Tests",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "pytest",
+      "args": [
+        "--disable-pytest-warnings",
+        "--cov=mx8fs",
+        "--cov-fail-under=100",
+        "--cov-branch",
+        "--cov-config=",
+        "--color=yes",
+        "--cov-report=lcov:coverage/lcov.info",
+        "--cov-report=term-missing:skip-covered",
+        "--durations=10",
+        "--verbose",
+        "--capture=no",
+        "--showlocals",
+        "--tb=short",
+        "tests"
+      ]
+    }
+  ]
+}
