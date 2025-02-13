@@ -62,7 +62,7 @@ jobs:
            sed -i "s/^version = \"\([0-9]*\.[0-9]*\.[0-9]*\)\"/version = \"\1.${{ github.run_number }}\"/" pyproject.toml
 
       - name: Run tests
-        run: pytest tests
+        run: poetry run pytest tests
 
       - name: Build package
         run: poetry build
