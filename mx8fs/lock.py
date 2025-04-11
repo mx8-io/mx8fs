@@ -31,7 +31,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 This version
 
-Copyright (c) 2024 MX8 Inc, all rights reserved.
+Copyright (c) 2024-2025 MX8 Inc, all rights reserved.
 
 """
 
@@ -178,7 +178,7 @@ class FileLock:
     def __enter__(self) -> "FileLock":
         """Acquire the lock on the file. This will wait until the lock is available."""
 
-        logger.info("Getting lock on %s", self.file)
+        logger.debug("Getting lock on %s", self.file)
 
         # If the file is locked then wait for it to be unlocked
         self.waiter.start_timeout()
@@ -199,13 +199,13 @@ class FileLock:
                 delete_file(self._lock_file)
                 raise ex
 
-        logger.info("Acquired lock on %s", self.file)
+        logger.debug("Acquired lock on %s", self.file)
         return self
 
     def __exit__(self, *_: List[Any], **__: Dict[str, Any]) -> None:
         """Release the lock on the file."""
         delete_file(self._lock_file)
-        logger.info("Released lock on %s", self.file)
+        logger.debug("Released lock on %s", self.file)
 
     def _get_lock_files(self) -> List[str]:
         """Get all the lock files for the current file."""

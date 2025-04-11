@@ -108,5 +108,5 @@ def test_aws_lambda(tmpdir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     base_path = str(tmpdir)
     monkeypatch.setenv("AWS_LAMBDA_FUNCTION_NAME", "test_lambda")
 
-    with pytest.raises(ValueError, match="Randomizer must be provided in AWS Lambda environment"):
+    with pytest.raises(ValueError, match="Cannot use random.seed as a randomizer in AWS Lambda environment"):
         JsonFileStorage(base_path)

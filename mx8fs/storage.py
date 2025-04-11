@@ -21,12 +21,14 @@ class JsonFileStorage:
 
     _extension: str
     _key_field: str
+    _randomizer: Callable[[], None] = random.seed
 
     def __init__(self, base_path: str, randomizer: Optional[Callable[[], None]] = None) -> None:
         self.base_path = base_path
+        self._randomizer = randomizer or self._randomizer
 
-        if "AWS_LAMBDA_FUNCTION_NAME" in os.environ and randomizer is None:
-            raise ValueError("Randomizer must be provided in AWS Lambda environment")
+        if "AWS_LAMBDA_FUNCTION_NAME" in os.environ and self._randomizer == random.seed:
+            raise ValueError("Cannot use random.seed as a randomizer in AWS Lambda environment")
 
         self.randomizer = randomizer or random.seed
 

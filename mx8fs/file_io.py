@@ -19,12 +19,12 @@ import boto3
 from botocore.config import Config
 
 boto_config = Config(
-    max_pool_connections=int(os.getenv("BOTO_MAX_CONNECTIONS", 10)),
-    connect_timeout=float(os.getenv("BOTO_CONNECT_TIMEOUT", 10.0)),
-    read_timeout=float(os.getenv("BOTO_READ_TIMEOUT", 10.0)),
+    max_pool_connections=int(os.getenv("BOTO_MAX_CONNECTIONS", 50)),
+    connect_timeout=float(os.getenv("BOTO_CONNECT_TIMEOUT", 5.0)),
+    read_timeout=float(os.getenv("BOTO_READ_TIMEOUT", 840.0)),  # 1 minute less than the lambda timeout
     retries={
-        "total_max_attempts": int(os.getenv("BOTO_MAX_RETRIES", 5)),
-        "mode": cast(Literal["legacy", "standard", "adaptive"], os.getenv("BOTO_RETRY_MODE", "standard")),
+        "total_max_attempts": int(os.getenv("BOTO_MAX_RETRIES", 10)),
+        "mode": cast(Literal["legacy", "standard", "adaptive"], os.getenv("BOTO_RETRY_MODE", "adaptive")),
     },
 )
 
@@ -97,11 +97,14 @@ def copy_file(src: str, dst: str) -> None:
         src_bucket, src_key = get_bucket_key(src)
         dst_bucket, dst_key = get_bucket_key(dst)
 
-        s3_client.copy_object(
-            Bucket=dst_bucket,
-            Key=dst_key,
-            CopySource={"Bucket": src_bucket, "Key": src_key},
-        )
+        try:
+            s3_client.copy_object(
+                Bucket=dst_bucket,
+                Key=dst_key,
+                CopySource={"Bucket": src_bucket, "Key": src_key},
+            )
+        except s3_client.exceptions.NoSuchKey as exc:
+            raise FileNotFoundError(f"File {src} not found") from exc
     else:
         os.makedirs(os.path.dirname(dst), exist_ok=True)
         copyfile(src, dst)
@@ -121,37 +124,21 @@ def list_files(root_path: str, file_type: str, prefix: str = "") -> List[str]:
     if root_path.startswith("s3://"):
         bucket, key = get_bucket_key(root_path)
         key = key + "/" if not key.endswith("/") else key
-        continuation_token = None
+
+        paginator = s3_client.get_paginator("list_objects_v2")
         files = []
 
-        while True:
-            boto_kwargs = {
-                "Bucket": bucket,
-                "Prefix": key + prefix,
-                "Delimiter": "/",
-            }
-
-            if continuation_token:
-                boto_kwargs["ContinuationToken"] = continuation_token
-
-            boto_response = s3_client.list_objects_v2(**boto_kwargs)
-
-            if "Contents" in boto_response:
+        for page in paginator.paginate(Bucket=bucket, Prefix=key + prefix, PaginationConfig={"PageSize": 10_000}):
+            if "Contents" in page:
                 files.extend(
                     [
-                        obj["Key"].replace(key, "").replace(f".{file_type}", "")
-                        for obj in boto_response["Contents"]
+                        obj["Key"].removeprefix(key).removesuffix(f".{file_type}")
+                        for obj in page["Contents"]
                         if obj["Key"].endswith(file_type)
                     ]
                 )
 
-            if boto_response.get("IsTruncated"):  # There are more objects to list
-                continuation_token = boto_response.get("NextContinuationToken")
-            else:
-                break
-
         return files
-
     return [os.path.split(f)[1][: -len(file_type) - 1] for f in glob(os.path.join(root_path, f"{prefix}*.{file_type}"))]
 
 

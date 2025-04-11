@@ -66,7 +66,7 @@ def _do_logging(
 
     if log_group:
         try:
-            logging.getLogger(log_group).info(
+            logging.getLogger(log_group).debug(
                 "Cache hit",
                 extra={
                     "cache_result": result,
@@ -79,7 +79,7 @@ def _do_logging(
             )
         except TypeError:  # pragma: no cover
             # If we get a type error, case the dangerous types to strings
-            logging.getLogger(log_group).info(
+            logging.getLogger(log_group).debug(
                 "Cache hit",
                 extra={
                     "cache_result": str(result),

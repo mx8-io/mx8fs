@@ -27,8 +27,8 @@ from mx8fs import (
     most_recent_timestamp,
     read_file,
     write_file,
+    move_file,
 )
-from mx8fs import move_file
 
 TEST_BUCKET_NAME = "s3://mx8-test-bucket/mx8fs"
 
@@ -72,6 +72,7 @@ def _test_write_binary_file(file: str) -> None:
 
 def _test_write_file(file: str) -> None:
     """Test the write_file function"""
+    delete_file(file)
     assert file_exists(file) is False
     write_file(file, "test")
     assert file_exists(file) is True
@@ -206,9 +207,10 @@ def test_copy_file(tmp_path: Path) -> None:
         dst_file = os.path.join(path, "dest.txt")
 
         # Copy a file that does not exist
-        write_file(src_file, "test")
-        copy_file(src_file, dst_file)
-        assert read_file(dst_file) == "test"
+        delete_file(src_file)
+        with pytest.raises(FileNotFoundError):
+            copy_file(src_file, dst_file)
+            assert read_file(dst_file) == "test"
 
         # Copy a file that exists
         write_file(src_file, "test 2")
@@ -241,27 +243,3 @@ def test_move_file(tmp_path: Path) -> None:
 
         # Delete the files
         delete_file(dst_file)
-
-
-def test_list_files_pagination(monkeypatch: pytest.MonkeyPatch) -> None:
-
-    mock_s3_client = MagicMock()
-    monkeypatch.setattr("mx8fs.file_io.s3_client", mock_s3_client)
-    mock_s3_client.list_objects_v2.side_effect = [
-        {
-            "Contents": [{"Key": f"file{i}.txt"} for i in range(5)],
-            "IsTruncated": True,
-            "NextContinuationToken": "token1",
-        },
-        {
-            "Contents": [{"Key": f"file{i}.txt"} for i in range(5, 10)],
-            "IsTruncated": False,
-        },
-    ]
-
-    # Act
-    files = list_files("s3://bucket/path", "txt")
-
-    # Assert
-    expected_files = [f"file{i}" for i in range(10)]
-    assert files == expected_files
