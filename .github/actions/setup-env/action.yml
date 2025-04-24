@@ -37,9 +37,6 @@ runs:
       shell: bash
       run: printenv | sort
 
-    - name: Checkout code
-      uses: actions/checkout@v3
-
     - name: List the files
       shell: bash
       run: ls -Rl
