@@ -4,8 +4,12 @@ on:
   push:
     branches:
       - main
+  pull_request:
+    branches:
+      - main
 env:
   AWS_REGION: "us-east-2"
+  CURRENT_BRANCH: ${{  github.base_ref || github.ref_name }}
 
 jobs:
   build-and-deploy:
@@ -18,19 +22,17 @@ jobs:
     environment: pypi
 
     steps:
-      - name: Set AWS account
-        run: echo "AWS_ACCOUNT_ID=951879228305" >> $GITHUB_ENV
 
       - run: echo "🎉 The job was automatically triggered by a ${{ github.event_name }} event."
       - run: echo "🐧 This job is now running on a ${{ runner.os }} server hosted by GitHub!"
-      - run: echo "🔎 The name of your branch is ${{ github.ref }} and your repository is ${{ github.repository }}."
+      - run: echo "🔎 The name of your branch is ${{ env.CURRENT_BRANCH }}."
       - run: echo "💡 The ${{ github.repository }} repository has been cloned to the runner."
-      - run: echo "🔎 Deploying to AWS account ${{ env.AWS_ACCOUNT_ID}} and region ${{ env.AWS_REGION }}."
+      - run: echo "🔎 Testing against the AWS account ${{ secrets.AWS_ACCOUNT_ID}} and region ${{ env.AWS_REGION }}."
 
       - name: configure aws credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: arn:aws:iam::${{ env.AWS_ACCOUNT_ID }}:role/github-actions-role
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/github-actions-role
           role-session-name: github-actions-deploy
           aws-region: ${{ env.AWS_REGION }}
 
@@ -55,7 +57,6 @@ jobs:
       - name: Install python dependencies
         run: |
           poetry install --with dev
-
 
       - name: Update version in pyproject.toml
         run: |
