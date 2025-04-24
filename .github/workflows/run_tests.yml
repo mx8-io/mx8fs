@@ -1,0 +1,27 @@
+name: Python Filesystem GitHub Actions Workflow
+
+on:
+  pull_request:
+    branches:
+      - main
+env:
+  AWS_REGION: "us-east-2"
+  CURRENT_BRANCH: ${{  github.base_ref || github.ref_name }}
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    permissions:
+      id-token: write
+      contents: read
+
+    environment: pypi
+
+    steps:
+
+      - name: Setup Environment
+        uses: ./.github/actions/setup-env
+
+      - name: Run tests
+        run: poetry run pytest tests
