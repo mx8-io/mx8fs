@@ -1,0 +1,59 @@
+name: "Setup python"
+description: "Setup Python and CDK for AWS deployment"
+
+inputs:
+  AWS_ACCOUNT_ID:
+    description: "AWS account ID to deploy to"
+    required: true
+  AWS_REGION:
+    description: "AWS region to deploy to"
+    required: true
+    default: "us-east-2"
+  CURRENT_BRANCH:
+    description: "Current branch"
+    required: true
+    default: ${{ github.base_ref || github.ref_name}}
+
+runs:
+  using: "composite"
+
+  steps:
+    - run: echo "🎉 The job was automatically triggered by a ${{ github.event_name }} event."
+      shell: bash
+    - run: echo "🐧 This job is now running on a ${{ runner.os }} server hosted by GitHub!"
+      shell: bash
+    - run: echo "🔎 The name of your branch is ${{ inputs.CURRENT_BRANCH }}."
+      shell: bash
+    - run: echo "💡 The ${{ github.repository }} repository has been cloned to the runner."
+      shell: bash
+    - run: echo "🔎 Testing against the AWS account ${{ inputs.AWS_ACCOUNT_ID}} and region ${{ inputs.AWS_REGION }}."
+      shell: bash
+
+    - name: configure aws credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: arn:aws:iam::${{ inputs.AWS_ACCOUNT_ID }}:role/github-actions-role
+        role-session-name: github-actions-deploy
+        aws-region: ${{ inputs.AWS_REGION }}
+
+    - name: Print environment variables
+      shell: bash
+      run: printenv | sort
+
+    - name: List the files
+      shell: bash
+      run: ls -Rl
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: "3.10"
+        cache: "pip"
+
+    - name: Install Poetry
+      uses: abatilo/actions-poetry@v3
+
+    - name: Install python dependencies
+      shell: bash
+      run: |
+        poetry install --with dev
