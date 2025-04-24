@@ -35,8 +35,6 @@ The project should open reasonable well in vs.code and includes three [launch co
 
 We use python type hinting with pylance and flake8 for linting. Unit tests are created to 100% branch coverage.
 
-Key libraries are Boto3 and FastAPI. Full details are in [requirements.txt](requirements.txt).
-
 The code is structured as follows:
 
 - The [mx8fs](mx8fs) folder contains the full library.

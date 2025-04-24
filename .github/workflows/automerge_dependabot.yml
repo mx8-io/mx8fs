@@ -1,0 +1,14 @@
+name: Auto approve and merge
+
+on:
+  pull_request:
+
+jobs:
+  auto-approve-and-merge:
+    runs-on: ubuntu-latest
+    steps:
+      - name: "Auto-approve and merge"
+        uses: ahmadnassri/action-dependabot-auto-merge@v2
+        with:
+          target: minor
+          github-token: ${{ secrets.MX8_DEPENDABOT_AUTO_MERGE }}
