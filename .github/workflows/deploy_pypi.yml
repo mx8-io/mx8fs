@@ -1,4 +1,4 @@
-name: Python Filesystem GitHub Actions Workflow
+name: Deploy to PyPi
 
 on:
   push:

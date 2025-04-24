@@ -1,4 +1,4 @@
-name: Python Filesystem GitHub Actions Workflow
+name: Run Tests
 
 on:
   pull_request:
@@ -15,8 +15,6 @@ jobs:
     permissions:
       id-token: write
       contents: read
-
-    environment: pypi
 
     steps:
       - name: Checkout code
