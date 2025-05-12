@@ -27,6 +27,7 @@ import urllib3
 
 from mx8fs import (
     BinaryFileHandler,
+    VersionMismatchError,
     copy_file,
     delete_file,
     file_exists,
@@ -281,8 +282,9 @@ def test_update_file(tmp_path: Path) -> None:
         assert version_2 != version
 
         # Write and check we cannot overwrite the file
+        time.sleep(1)
         write_file(test_file, "test 3")
-        with pytest.raises(FileNotFoundError):
+        with pytest.raises(VersionMismatchError):
             update_file_if_version_matches(test_file, "test 4", version_2)
 
         assert read_file(test_file) == "test 3"
