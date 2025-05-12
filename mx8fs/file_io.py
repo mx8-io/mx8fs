@@ -129,7 +129,7 @@ def update_file_if_version_matches(file: str, data: str, version: str) -> None:
         except s3_client.exceptions.NoSuchKey as exc:
             raise FileNotFoundError("File does not exist") from exc
         except s3_client.exceptions.ClientError as exc:
-            if exc.response["Error"]["Code"] == "PreconditionFailed":
+            if exc.response["Error"]["Code"] in ["PreconditionFailed", "Conflict"]:
                 raise VersionMismatchError(f"File with the etag {version} does not exist") from exc
             else:  # pragma: no cover
                 raise exc
