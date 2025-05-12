@@ -25,8 +25,7 @@ from logging import getLogger
 from tempfile import NamedTemporaryFile
 from typing import Any, Dict, List, Optional
 
-
-from mx8fs import read_file, write_file
+from mx8fs.file_io import read_file, write_file
 
 logger = getLogger("mx8.comparer")
 

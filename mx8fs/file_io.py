@@ -76,6 +76,28 @@ def read_file(file: str) -> str:
             return file_io.read()
 
 
+def read_file_with_version(file: str) -> Tuple[str, str]:
+    """Read a file from S3 or local storage with UTF-8 encoding and a version identifier
+
+    For S3, the version identifier is the ETag of the file.
+    For local storage, the version identifier is the last modified time of the file.
+
+    :param file: The file to read
+    :return: The file contents and the version identifier
+    """
+    if file.startswith("s3://"):
+        bucket, key = get_bucket_key(file)
+        try:
+            response = s3_client.get_object(Bucket=bucket, Key=key)
+            return str(response["Body"].read().decode("utf-8")), response["ETag"].strip('"')
+        except s3_client.exceptions.NoSuchKey as exc:
+            raise FileNotFoundError(f"File {file} not found") from exc
+    else:
+        with open(file, mode="r", encoding="UTF-8") as file_io:
+            # Use the file's last modified time as a unique hash
+            return file_io.read(), str(os.path.getmtime(file))
+
+
 def write_file(file: str, data: str) -> None:
     """Write a file to S3 or local storage with UTF-8 encoding"""
     if file.startswith("s3://"):
@@ -85,6 +107,42 @@ def write_file(file: str, data: str) -> None:
         os.makedirs(os.path.dirname(file), exist_ok=True)
         with open(file, mode="w", encoding="UTF-8") as file_io:
             file_io.write(data)
+
+
+def update_file_if_version_matches(file: str, data: str, version: str) -> None:
+    """Write a file to S3 or local storage with UTF-8 encoding if the version matches.
+
+    For S3, the version identifier is the ETag of the file.
+    For local storage, the version identifier is the last modified time of the file.
+
+    :param file: The file to write
+    :param data: The data to write
+    """
+    if file.startswith("s3://"):
+        bucket, key = get_bucket_key(file)
+        try:
+            s3_client.put_object(Bucket=bucket, Key=key, Body=data.encode("UTF-8"), IfMatch=version)
+        except s3_client.exceptions.NoSuchKey as exc:
+            raise FileNotFoundError("File does not exist") from exc
+        except s3_client.exceptions.ClientError as exc:
+            if exc.response["Error"]["Code"] == "PreconditionFailed":
+                raise FileNotFoundError(f"File with the etag {version} does not exist") from exc
+            else:  # pragma: no cover
+                raise exc
+    else:
+        if not os.path.exists(file):
+            raise FileNotFoundError(f"File {file} not found")
+
+        # Lock the local file and compare the timestamp
+        from mx8fs import FileLock
+
+        with FileLock(file) as _:
+            file_mtime = os.path.getmtime(file)
+            if str(file_mtime) != version:
+                raise FileNotFoundError(f"File with the etag {version} does not exist")
+            else:
+                with open(file, mode="w", encoding="UTF-8") as file_io:
+                    file_io.write(data)
 
 
 def delete_file(file: str) -> None:
