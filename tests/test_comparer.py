@@ -18,13 +18,28 @@ OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHE
 TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 """
 
-import os
 import json
+import os
 from pathlib import Path
 from typing import Any, Callable
+
 import pytest
-from httpx import Response
-from mx8fs import ResultsComparer, write_file, read_file
+
+from mx8fs import ResultsComparer, read_file, write_file
+
+
+class Response:
+    def __init__(self, status_code: int, content: bytes = b"", json: Any = None) -> None:
+        self.status_code = status_code
+        self.content = content.decode("utf-8")
+        self._json = json
+
+    def json(self) -> Any:
+        return self._json or json.loads(self.content)
+
+    @property
+    def text(self) -> str:
+        return self.content
 
 
 @pytest.fixture(name="save_text")

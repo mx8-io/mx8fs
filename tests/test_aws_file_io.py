@@ -33,9 +33,11 @@ from mx8fs import (
     get_public_url,
     list_files,
     most_recent_timestamp,
-    read_file,
-    write_file,
     move_file,
+    read_file,
+    read_file_with_version,
+    update_file_if_version_matches,
+    write_file,
 )
 
 TEST_BUCKET_NAME = "s3://mx8-test-bucket/mx8fs"
@@ -251,3 +253,38 @@ def test_move_file(tmp_path: Path) -> None:
 
         # Delete the files
         delete_file(dst_file)
+
+
+def test_update_file(tmp_path: Path) -> None:
+    """Test the update_file function"""
+
+    for path in [f"s3://{TEST_BUCKET_NAME}/", str(tmp_path)]:
+        test_file = os.path.join(path, "src.txt")
+
+        # Try to read a file that does not exist
+        delete_file(test_file)
+        with pytest.raises(FileNotFoundError):
+            read_file_with_version(test_file)
+
+        # Try to update a file that does not exist
+        with pytest.raises(FileNotFoundError):
+            update_file_if_version_matches(test_file, "test", "bad_version")  # noqa: F821
+
+        # Update a file that does exist
+        write_file(test_file, "test")
+        contents, version = read_file_with_version(test_file)
+        assert contents == "test"
+        update_file_if_version_matches(test_file, "test 2", version)
+        assert read_file(test_file) == "test 2"
+        contents, version_2 = read_file_with_version(test_file)
+        assert contents == "test 2"
+        assert version_2 != version
+
+        # Write and check we cannot overwrite the file
+        write_file(test_file, "test 3")
+        with pytest.raises(FileNotFoundError):
+            update_file_if_version_matches(test_file, "test 4", version_2)
+
+        assert read_file(test_file) == "test 3"
+
+        delete_file(test_file)
