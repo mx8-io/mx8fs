@@ -43,6 +43,10 @@ s3_client = boto3.client(
 )
 
 
+class VersionMismatchError(FileNotFoundError):
+    """Custom error for version mismatch when writing files"""
+
+
 def get_bucket_key(path: str) -> Tuple[str, str]:
     """Get the bucket and key from a S3 path"""
     path = path.replace("s3://", "")
@@ -126,7 +130,7 @@ def update_file_if_version_matches(file: str, data: str, version: str) -> None:
             raise FileNotFoundError("File does not exist") from exc
         except s3_client.exceptions.ClientError as exc:
             if exc.response["Error"]["Code"] == "PreconditionFailed":
-                raise FileNotFoundError(f"File with the etag {version} does not exist") from exc
+                raise VersionMismatchError(f"File with the etag {version} does not exist") from exc
             else:  # pragma: no cover
                 raise exc
     else:
@@ -139,7 +143,7 @@ def update_file_if_version_matches(file: str, data: str, version: str) -> None:
         with FileLock(file) as _:
             file_mtime = os.path.getmtime(file)
             if str(file_mtime) != version:
-                raise FileNotFoundError(f"File with the etag {version} does not exist")
+                raise VersionMismatchError(f"File with the etag {version} does not exist")
             else:
                 with open(file, mode="w", encoding="UTF-8") as file_io:
                     file_io.write(data)
