@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "mx8fs"
-version = "1.0.0"
+version = "1.1.0"
 description = "MX8 Filing system"
 authors = ["Tom Weiss <tom@mx8labs.com>"]
 readme = "README.md"
