@@ -121,6 +121,7 @@ class ResultsComparer:
 
     def compare_dicts(self, correct: Any, test: Any) -> Differences:
         """Compare two dictionaries"""
+        self._differences.clear()
         self._compare_dicts(correct, test)
         return self._differences
 
