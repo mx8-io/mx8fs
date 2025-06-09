@@ -17,9 +17,10 @@ OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHE
 TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 """
 
+import hashlib
 import json
 import os
-import shutil
+import re
 from difflib import ndiff
 from logging import getLogger
 from tempfile import NamedTemporaryFile
@@ -50,6 +51,9 @@ class Differences:
     def __len__(self) -> int:
         return len(self._differences)
 
+    def contains(self, key: str) -> bool:
+        return any(key in v for d in self._differences for v in d.values())
+
     def append(self, differences: Dict[str, str]) -> None:
         self._differences.append(differences)
 
@@ -62,14 +66,69 @@ class Differences:
 
 
 class ResultsComparer:
+    DEFAULT_OBFUSCATE_PARAMETERS = [
+        "TWILIO_AUTH_TOKEN",
+        "SQUARE_ACCESS_TOKEN",
+        "TWILIO_TEST_AUTH_TOKEN",
+        "WEBHOOK_URL",
+        "API_KEY",
+        "SECRET_KEY",
+        "PASSWORD",
+        "ACCESS_TOKEN",
+        "PRIVATE_KEY",
+        "CLIENT_SECRET",
+        "DB_PASSWORD",
+        "AUTH_TOKEN",
+        "REFRESH_TOKEN",
+    ]
+
     def __init__(
         self,
         ignore_keys: Optional[List[str]],
         create_test_data: bool = False,
+        obfuscate_parameters: Optional[List[str]] = None,
     ) -> None:
+        self._obfuscate_parameters = (
+            obfuscate_parameters if obfuscate_parameters is not None else self.DEFAULT_OBFUSCATE_PARAMETERS.copy()
+        )
         self._ignore_keys = ignore_keys if ignore_keys else []
         self._create_test_data = create_test_data
         self._differences = Differences()
+
+    @staticmethod
+    def _obfuscate_value(value: str) -> str:
+        h = hashlib.sha256(value.encode("utf-8")).hexdigest()
+        return f"OBFUSCATED-{h}"
+
+    def _obfuscate_dict(self, d: Any) -> Any:
+        if isinstance(d, dict):
+            return {
+                k: (self._obfuscate_dict(v) if k not in self._obfuscate_parameters else self._obfuscate_value(str(v)))
+                for k, v in d.items()
+            }
+        elif isinstance(d, list):
+            return [self._obfuscate_dict(item) for item in d]
+        else:
+            return d
+
+    @staticmethod
+    def _obfuscate_text(text: str, sensitive_keys: List[str]) -> str:
+        # For each sensitive key, obfuscate its value to the end of the line
+        def obfuscate_line(line: str) -> str:
+            for key in sensitive_keys:
+                # Match key: "value" or key = "value" or key: value
+                # This is a best-effort, not a full parser
+                pattern = rf'("{key}"\s*:\s*|{key}\s*=\s*|{key}\s*:\s*)(["\']?)(.+?)(["\']?)($|\s|,)'
+
+                def repl(m: Any) -> str:
+                    value = m.group(3)
+                    obf = ResultsComparer._obfuscate_value(value)
+                    return f"{m.group(1)}{obf}{m.group(5)}"
+
+                line = re.sub(pattern, repl, line)
+            return line
+
+        return "\n".join(obfuscate_line(line) for line in text.splitlines())
 
     def _log_differences(self, key: str, correct: str, test: str) -> None:
         """Log the differences between two strings"""
@@ -127,16 +186,20 @@ class ResultsComparer:
 
     def get_text_differences(self, test: str, correct: str) -> Differences:
         """Compare a test file with a correct file"""
+        differences = Differences()
+
+        # Obfuscate the test file content before diffing
+        test_content = read_file(test)
+        obfuscated_test_content = self._obfuscate_text(test_content, self._obfuscate_parameters)
+
         if self._create_test_data:
             # make the directory if it doesn't exist
             os.makedirs(os.path.dirname(correct), exist_ok=True)
+            write_file(correct, obfuscated_test_content)
 
-            # copy the test file to the correct file
-            shutil.copyfile(test, correct)
+        correct_content = read_file(correct)
 
-        differences = Differences()
-
-        if diff := get_diff(read_file(correct), read_file(test)):
+        if diff := get_diff(correct_content, obfuscated_test_content):
             differences.append({"file": diff})
 
         return differences
@@ -144,23 +207,24 @@ class ResultsComparer:
     def get_dict_differences(self, test: str, correct: str) -> Differences:
         """Compare a test file with a correct file"""
 
-        # Load the test file
+        # Load and obfuscate the test file
         test_dict = json.loads(read_file(test))
+        obfuscated_test_dict = self._obfuscate_dict(test_dict)
 
         self._differences.clear()
         if self._create_test_data:
             try:
                 correct_dict = json.loads(read_file(correct))
-                self._compare_dicts(correct_dict, test_dict)
+                self._compare_dicts(correct_dict, obfuscated_test_dict)
                 assert self._differences == [], "The files should be identical"
             except (FileNotFoundError, AssertionError):
-                # Save the test file as the correct file
+                # Save the obfuscated test file as the correct file
                 os.makedirs(os.path.dirname(correct), exist_ok=True)
-                write_file(correct, json.dumps(test_dict, indent=4, ensure_ascii=False).strip())
+                write_file(correct, json.dumps(obfuscated_test_dict, indent=4, ensure_ascii=False).strip())
                 self._differences.clear()
         else:
             correct_dict = json.loads(read_file(correct))
-            self._compare_dicts(correct_dict, test_dict)
+            self._compare_dicts(correct_dict, obfuscated_test_dict)
 
         return self._differences
 

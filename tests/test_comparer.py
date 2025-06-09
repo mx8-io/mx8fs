@@ -214,3 +214,83 @@ def test_compare_dicts() -> None:
         {"key": "value", "nested": {"key": "nested_value"}},
     )
     assert not differences, "Identical dictionaries should have no differences"
+
+
+def test_obfuscate_parameters_top_and_nested(save_dict: Callable[[Any], str]) -> None:
+    # Top-level and nested sensitive keys
+    test_dict = {
+        "TWILIO_AUTH_TOKEN": "secret1",
+        "nested": {
+            "SQUARE_ACCESS_TOKEN": "secret2",
+            "list": [{"TWILIO_TEST_AUTH_TOKEN": "secret3"}, {"other": "value"}],
+        },
+    }
+    comparer = ResultsComparer(ignore_keys=None, create_test_data=True)
+    test_file = save_dict(test_dict)
+    correct_file = save_dict({})
+    comparer.get_dict_differences(test_file, correct_file)
+    obfuscated = json.loads(read_file(correct_file))
+    from mx8fs.comparer import ResultsComparer as RC
+
+    assert obfuscated["TWILIO_AUTH_TOKEN"].startswith("OBFUSCATED-")
+    assert obfuscated["TWILIO_AUTH_TOKEN"] == RC._obfuscate_value("secret1")
+    assert obfuscated["nested"]["SQUARE_ACCESS_TOKEN"] == RC._obfuscate_value("secret2")
+    assert obfuscated["nested"]["list"][0]["TWILIO_TEST_AUTH_TOKEN"] == RC._obfuscate_value("secret3")
+    assert obfuscated["nested"]["list"][1]["other"] == "value"
+
+
+def test_obfuscate_parameters_ignored_in_diff(save_dict: Callable[[Any], str]) -> None:
+    # Differences in sensitive keys should be ignored
+    test_dict = {
+        "TWILIO_AUTH_TOKEN": "secret1",
+        "nested": {"SQUARE_ACCESS_TOKEN": "secret2"},
+    }
+    comparer = ResultsComparer(ignore_keys=None, create_test_data=True)
+    test_file = save_dict(test_dict)
+    correct_file = save_dict({})
+
+    assert not comparer.get_dict_differences(test_file, correct_file)
+
+    comparer = ResultsComparer(ignore_keys=None, create_test_data=False)
+    assert not comparer.get_dict_differences(test_file, correct_file)
+
+    assert len(comparer.get_dict_differences(test_file, test_file)) == 2
+
+    comparer = ResultsComparer(obfuscate_parameters=["TWILIO_AUTH_TOKEN"], ignore_keys=None, create_test_data=False)
+    differences = comparer.get_dict_differences(test_file, correct_file)
+    assert len(differences) == 1, "There should be one difference"
+
+
+def test_obfuscate_text_differences(save_text: Callable[[Any], str]) -> None:
+    # Sensitive values in text files should be obfuscated to the end of the line
+    test_content = (
+        "TWILIO_AUTH_TOKEN: secret1\n"
+        "SQUARE_ACCESS_TOKEN = secret2\n"
+        "other: value\n"
+        'TWILIO_TEST_AUTH_TOKEN: "secret3"\n'
+        "not_sensitive: keepme\n"
+    )
+    comparer = ResultsComparer(ignore_keys=None, create_test_data=True)
+    test_file = save_text(test_content)
+    correct_file = save_text("")
+
+    assert not comparer.get_text_differences(test_file, correct_file)
+
+    comparer = ResultsComparer(ignore_keys=None, create_test_data=False)
+    assert not comparer.get_text_differences(test_file, correct_file)
+
+    differences = comparer.get_text_differences(test_file, test_file)
+
+    assert differences.contains("+ TWILIO_AUTH_TOKEN: OBFUSCATED-")
+    assert differences.contains("+ SQUARE_ACCESS_TOKEN = OBFUSCATED-")
+    assert differences.contains("+ TWILIO_TEST_AUTH_TOKEN: OBFUSCATED-")
+
+    comparer = ResultsComparer(
+        obfuscate_parameters=["TWILIO_AUTH_TOKEN"],
+        ignore_keys=None,
+        create_test_data=False,
+    )
+    differences = comparer.get_text_differences(test_file, correct_file)
+    assert differences.contains("+ TWILIO_AUTH_TOKEN: OBFUSCATED-")
+    assert differences.contains("- SQUARE_ACCESS_TOKEN = OBFUSCATED-")
+    assert differences.contains("- TWILIO_TEST_AUTH_TOKEN: OBFUSCATED-")
