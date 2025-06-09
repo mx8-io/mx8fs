@@ -67,7 +67,7 @@ def fixture_save_dict(save_text: Callable[[str], str]) -> Callable[[Any], str]:
 
 
 def test_compare_identical_files(save_dict: Callable[[Any], str]) -> None:
-    test_dict = {"key": "value", "nested": {"key": "nested_value"}}
+    test_dict = {"any": "value", "nested": {"any": "nested_value"}}
     test_file = save_dict(test_dict)
     correct_file = save_dict(test_dict)
 
@@ -80,24 +80,24 @@ def test_compare_identical_files(save_dict: Callable[[Any], str]) -> None:
 
 
 def test_compare_different_files(save_dict: Callable[[Any], str]) -> None:
-    test_file = save_dict({"key": "value", "nested": {"key": "nested_value"}})
-    correct_file = save_dict({"key": "different_value", "nested": {"key": "nested_value"}})
+    test_file = save_dict({"any": "value", "nested": {"any": "nested_value"}})
+    correct_file = save_dict({"any": "different_value", "nested": {"any": "nested_value"}})
 
     comparer = ResultsComparer(ignore_keys=None, create_test_data=False)
 
     differences = comparer.get_dict_differences(test_file, correct_file)
 
     assert len(differences) == 1, "There should be one difference"
-    assert "root/key" in differences.keys, "Difference should be in the root key"
+    assert "root/any" in differences.keys, "Difference should be in the root key"
 
     # Now test the same with ignore_keys
-    comparer = ResultsComparer(ignore_keys=["key"], create_test_data=False)
+    comparer = ResultsComparer(ignore_keys=["any"], create_test_data=False)
     assert comparer.get_dict_differences(test_file, correct_file) == [], "Differences should be ignored"
 
 
 def test_create_test_data(save_dict: Callable[[Any], str]) -> None:
-    test_file = save_dict({"key": "value", "nested": {"key": "nested_value"}})
-    correct_file = save_dict({"key": "different_value", "nested": {"key": "nested_value"}})
+    test_file = save_dict({"any": "value", "nested": {"any": "nested_value"}})
+    correct_file = save_dict({"any": "different_value", "nested": {"any": "nested_value"}})
 
     comparer = ResultsComparer(ignore_keys=None, create_test_data=True)
 
@@ -112,48 +112,48 @@ def test_create_test_data(save_dict: Callable[[Any], str]) -> None:
 def test_compare_nested_differences(save_dict: Callable[[Any], str]) -> None:
     comparer = ResultsComparer(ignore_keys=None, create_test_data=False)
     differences = comparer.get_dict_differences(
-        save_dict({"key": "value", "nested": {"key": "nested_value"}}),
-        save_dict({"key": "value", "nested": {"key": "different_nested_value"}}),
+        save_dict({"any": "value", "nested": {"any": "nested_value"}}),
+        save_dict({"any": "value", "nested": {"any": "different_nested_value"}}),
     )
 
     assert len(differences) == 1, "There should be one nested difference"
-    assert "root/nested/key" in differences.keys, "Difference should be in the nested key"
+    assert "root/nested/any" in differences.keys, "Difference should be in the nested key"
 
     # Now compare with key names changing
     differences = comparer.get_dict_differences(
-        save_dict({"key": "value", "nested": {"key": "nested_value"}}),
-        save_dict({"key": "value", "nested": {"different_key": "nested_value"}}),
+        save_dict({"any": "value", "nested": {"any": "nested_value"}}),
+        save_dict({"any": "value", "nested": {"different_key": "nested_value"}}),
     )
     assert len(differences) == 1, "There should be one nested difference"
     assert "root/nested" in differences.keys, "Difference should be in the nested key"
 
     # Now compare with the difference in a list size
     differences = comparer.get_dict_differences(
-        save_dict({"key": "value", "nested": {"key": ["nested_value", "nested_value2"]}}),
-        save_dict({"key": "value", "nested": {"key": ["nested_value"]}}),
+        save_dict({"any": "value", "nested": {"any": ["nested_value", "nested_value2"]}}),
+        save_dict({"any": "value", "nested": {"any": ["nested_value"]}}),
     )
     assert len(differences) == 1, "There should be one nested difference"
-    assert "root/nested/key" in differences.keys, "Difference should be in the nested key"
+    assert "root/nested/any" in differences.keys, "Difference should be in the nested key"
 
     # Now compare with the difference in list values
     differences = comparer.get_dict_differences(
-        save_dict({"key": "value", "nested": {"key": ["nested_value", "nested_value2"]}}),
-        save_dict({"key": "value", "nested": {"key": ["nested_value", "nested_value3"]}}),
+        save_dict({"any": "value", "nested": {"any": ["nested_value", "nested_value2"]}}),
+        save_dict({"any": "value", "nested": {"any": ["nested_value", "nested_value3"]}}),
     )
     assert len(differences) == 1, "There should be one nested difference"
-    assert "root/nested/key[1]" in differences.keys, "Difference should be in the nested key"
+    assert "root/nested/any[1]" in differences.keys, "Difference should be in the nested key"
 
     # Now test ignore keys
     comparer = ResultsComparer(ignore_keys=["nested"], create_test_data=False)
     differences = comparer.get_dict_differences(
-        save_dict({"key": "value", "nested": {"key": "nested_value"}}),
-        save_dict({"key": "value", "nested": {"key": "different_nested_value"}}),
+        save_dict({"any": "value", "nested": {"any": "nested_value"}}),
+        save_dict({"any": "value", "nested": {"any": "different_nested_value"}}),
     )
     assert differences == [], "Differences should be ignored"
 
 
 def test_api_response_differences(save_dict: Callable[[Any], str]) -> None:
-    dict_value = {"key": "value", "nested": {"key": "nested_value"}}
+    dict_value = {"any": "value", "nested": {"any": "nested_value"}}
     correct_file = save_dict(dict_value)
     response = Response(200, json=dict_value)
 
@@ -164,17 +164,17 @@ def test_api_response_differences(save_dict: Callable[[Any], str]) -> None:
 
 
 def test_api_response_differences_with_changes(save_dict: Callable[[Any], str]) -> None:
-    dict_value = {"key": "value", "nested": {"key": "nested_value"}}
+    dict_value = {"any": "value", "nested": {"any": "nested_value"}}
     correct_file = save_dict(dict_value)
 
-    dict_value["key"] = "different_value"
+    dict_value["any"] = "different_value"
     response = Response(200, json=dict_value)
 
     comparer = ResultsComparer(ignore_keys=None, create_test_data=False)
     differences = comparer.get_api_response_differences(response, correct_file)
 
     assert len(differences) == 1, "There should be one difference"
-    assert "root/key" in differences.keys, "Difference should be in the root key"
+    assert "root/any" in differences.keys, "Difference should be in the root key"
 
 
 def test_api_response_text_differences(save_text: Callable[[Any], str]) -> None:
@@ -210,8 +210,8 @@ def test_api_text_differences_created(save_text: Callable[[Any], str]) -> None:
 def test_compare_dicts() -> None:
     comparer = ResultsComparer(ignore_keys=None, create_test_data=False)
     differences = comparer.compare_dicts(
-        {"key": "value", "nested": {"key": "nested_value"}},
-        {"key": "value", "nested": {"key": "nested_value"}},
+        {"any": "value", "nested": {"any": "nested_value"}},
+        {"any": "value", "nested": {"any": "nested_value"}},
     )
     assert not differences, "Identical dictionaries should have no differences"
 
@@ -256,7 +256,7 @@ def test_obfuscate_parameters_ignored_in_diff(save_dict: Callable[[Any], str]) -
 
     assert len(comparer.get_dict_differences(test_file, test_file)) == 2
 
-    comparer = ResultsComparer(obfuscate_parameters=["TWILIO_AUTH_TOKEN"], ignore_keys=None, create_test_data=False)
+    comparer = ResultsComparer(obfuscate_regex="twilio_auth", ignore_keys=None, create_test_data=False)
     differences = comparer.get_dict_differences(test_file, correct_file)
     assert len(differences) == 1, "There should be one difference"
 
@@ -281,16 +281,16 @@ def test_obfuscate_text_differences(save_text: Callable[[Any], str]) -> None:
 
     differences = comparer.get_text_differences(test_file, test_file)
 
-    assert differences.contains("+ TWILIO_AUTH_TOKEN: OBFUSCATED-")
-    assert differences.contains("+ SQUARE_ACCESS_TOKEN = OBFUSCATED-")
-    assert differences.contains("+ TWILIO_TEST_AUTH_TOKEN: OBFUSCATED-")
+    assert differences.contains("- TWILIO_AUTH_TOKEN")
+    assert differences.contains("- SQUARE_ACCESS_TOKEN")
+    assert differences.contains("- TWILIO_TEST_AUTH_TOKEN")
 
     comparer = ResultsComparer(
-        obfuscate_parameters=["TWILIO_AUTH_TOKEN"],
+        obfuscate_regex="twilio_auth",
         ignore_keys=None,
         create_test_data=False,
     )
-    differences = comparer.get_text_differences(test_file, correct_file)
-    assert differences.contains("+ TWILIO_AUTH_TOKEN: OBFUSCATED-")
-    assert differences.contains("- SQUARE_ACCESS_TOKEN = OBFUSCATED-")
-    assert differences.contains("- TWILIO_TEST_AUTH_TOKEN: OBFUSCATED-")
+    differences = comparer.get_text_differences(test_file, test_file)
+    assert differences.contains("- TWILIO_AUTH_TOKEN")
+    assert not differences.contains("- SQUARE_ACCESS_TOKEN")
+    assert not differences.contains("- TWILIO_TEST_AUTH_TOKEN")

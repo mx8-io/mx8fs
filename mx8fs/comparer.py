@@ -66,30 +66,16 @@ class Differences:
 
 
 class ResultsComparer:
-    DEFAULT_OBFUSCATE_PARAMETERS = [
-        "TWILIO_AUTH_TOKEN",
-        "SQUARE_ACCESS_TOKEN",
-        "TWILIO_TEST_AUTH_TOKEN",
-        "WEBHOOK_URL",
-        "API_KEY",
-        "SECRET_KEY",
-        "PASSWORD",
-        "ACCESS_TOKEN",
-        "PRIVATE_KEY",
-        "CLIENT_SECRET",
-        "DB_PASSWORD",
-        "AUTH_TOKEN",
-        "REFRESH_TOKEN",
-    ]
+    _DEFAULT_OBFUSCATE_REGEX = ".*(password|secret|token|key|auth|credentials|salt|signature|hash).*"
 
     def __init__(
         self,
         ignore_keys: Optional[List[str]],
         create_test_data: bool = False,
-        obfuscate_parameters: Optional[List[str]] = None,
+        obfuscate_regex: Optional[str] = None,
     ) -> None:
-        self._obfuscate_parameters = (
-            obfuscate_parameters if obfuscate_parameters is not None else self.DEFAULT_OBFUSCATE_PARAMETERS.copy()
+        self._regex_obfuscation = re.compile(
+            obfuscate_regex if obfuscate_regex is not None else self._DEFAULT_OBFUSCATE_REGEX, re.IGNORECASE
         )
         self._ignore_keys = ignore_keys if ignore_keys else []
         self._create_test_data = create_test_data
@@ -103,7 +89,7 @@ class ResultsComparer:
     def _obfuscate_dict(self, d: Any) -> Any:
         if isinstance(d, dict):
             return {
-                k: (self._obfuscate_dict(v) if k not in self._obfuscate_parameters else self._obfuscate_value(str(v)))
+                k: (self._obfuscate_value(str(v)) if self._regex_obfuscation.search(k) else self._obfuscate_dict(v))
                 for k, v in d.items()
             }
         elif isinstance(d, list):
@@ -111,21 +97,13 @@ class ResultsComparer:
         else:
             return d
 
-    @staticmethod
-    def _obfuscate_text(text: str, sensitive_keys: List[str]) -> str:
+    def _obfuscate_text(self, text: str) -> str:
         # For each sensitive key, obfuscate its value to the end of the line
         def obfuscate_line(line: str) -> str:
-            for key in sensitive_keys:
-                # Match key: "value" or key = "value" or key: value
-                # This is a best-effort, not a full parser
-                pattern = rf'("{key}"\s*:\s*|{key}\s*=\s*|{key}\s*:\s*)(["\']?)(.+?)(["\']?)($|\s|,)'
+            if self._regex_obfuscation.search(line):
+                # If the line contains a sensitive key, obfuscate it
+                return self._obfuscate_value(line)
 
-                def repl(m: Any) -> str:
-                    value = m.group(3)
-                    obf = ResultsComparer._obfuscate_value(value)
-                    return f"{m.group(1)}{obf}{m.group(5)}"
-
-                line = re.sub(pattern, repl, line)
             return line
 
         return "\n".join(obfuscate_line(line) for line in text.splitlines())
@@ -190,7 +168,7 @@ class ResultsComparer:
 
         # Obfuscate the test file content before diffing
         test_content = read_file(test)
-        obfuscated_test_content = self._obfuscate_text(test_content, self._obfuscate_parameters)
+        obfuscated_test_content = self._obfuscate_text(test_content)
 
         if self._create_test_data:
             # make the directory if it doesn't exist
