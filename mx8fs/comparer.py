@@ -66,7 +66,7 @@ class Differences:
 
 
 class ResultsComparer:
-    _DEFAULT_OBFUSCATE_REGEX = ".*(password|secret|token|key|auth|credentials|salt|signature|hash).*"
+    _DEFAULT_OBFUSCATE_REGEX = ".*(password|secret|token|key|auth|credentials|salt|signature|hash|webhook).*"
 
     def __init__(
         self,
