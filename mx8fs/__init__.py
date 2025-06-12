@@ -12,6 +12,7 @@ from .cache import cache_to_disk, cache_to_disk_binary, get_cache_filename
 from .comparer import ResultsComparer
 from .file_io import (
     BinaryFileHandler,
+    GzipFileHandler,
     VersionMismatchError,
     copy_file,
     delete_file,
@@ -30,6 +31,7 @@ from .storage import JsonFileStorage, json_file_storage_factory
 
 __all__ = [
     "BinaryFileHandler",
+    "GzipFileHandler",
     "cache_to_disk_binary",
     "cache_to_disk",
     "copy_file",

@@ -27,6 +27,7 @@ import urllib3
 
 from mx8fs import (
     BinaryFileHandler,
+    GzipFileHandler,
     VersionMismatchError,
     copy_file,
     delete_file,
@@ -221,7 +222,6 @@ def test_copy_file(tmp_path: Path) -> None:
         delete_file(src_file)
         with pytest.raises(FileNotFoundError):
             copy_file(src_file, dst_file)
-            assert read_file(dst_file) == "test"
 
         # Copy a file that exists
         write_file(src_file, "test 2")
@@ -254,6 +254,122 @@ def test_move_file(tmp_path: Path) -> None:
 
         # Delete the files
         delete_file(dst_file)
+
+
+@pytest.mark.parametrize("base_path", [f"s3://{TEST_BUCKET_NAME}/gzip_test/", None])
+def test_gzip_file_handler(tmp_path: Path, base_path: str) -> None:
+    """
+    Test GzipFileHandler for both S3 and local paths, in binary and text modes.
+    """
+    if base_path is None:
+        base_path = str(tmp_path)
+    gzip_file = os.path.join(base_path, "test.gz")
+
+    # Clean up before test
+    delete_file(gzip_file)
+
+    # Test writing and reading in binary mode
+    data = b"hello gzip binary"
+    with GzipFileHandler(gzip_file, "wb") as f:
+        f.write(data)
+    assert file_exists(gzip_file)
+    with GzipFileHandler(gzip_file, "rb") as f:
+        assert f.read() == data
+
+    # Test writing and reading in text mode
+    text = "hello gzip text"
+    with GzipFileHandler(gzip_file, "wt", encoding="utf-8") as f:
+        f.write(text)
+    assert file_exists(gzip_file)
+    with GzipFileHandler(gzip_file, "rt", encoding="utf-8") as f:
+        assert f.read() == text
+
+    # Test error on missing file (read)
+    delete_file(gzip_file)
+    with pytest.raises(FileNotFoundError):
+        with GzipFileHandler(gzip_file, "rb") as f:
+            f.read()
+    with pytest.raises(FileNotFoundError):
+        with GzipFileHandler(gzip_file, "rt", encoding="utf-8") as f:
+            f.read()
+
+    # Test unsupported mode
+    with pytest.raises(NotImplementedError):
+        with GzipFileHandler(gzip_file, "r") as f:
+            raise AssertionError("Expected NotImplementedError")
+
+    # Clean up after test
+    delete_file(gzip_file)
+
+
+@pytest.mark.parametrize("base_path", [f"s3://{TEST_BUCKET_NAME}/gzip_test_edge/", None])
+def test_gzip_file_handler_edge_cases(tmp_path: Path, base_path: str) -> None:
+    """
+    Edge case tests for GzipFileHandler (S3 and local).
+    """
+    if base_path is None:
+        base_path = str(tmp_path)
+    gzip_file = os.path.join(base_path, "edge.gz")
+    delete_file(gzip_file)
+
+    # Empty file (binary)
+    with GzipFileHandler(gzip_file, "wb") as f:
+        assert f.closed is False
+
+    with GzipFileHandler(gzip_file, "rb") as f:
+        assert f.read() == b""
+
+    # Empty file (text)
+    with GzipFileHandler(gzip_file, "wt", encoding="utf-8") as f:
+        assert f.closed is False
+
+    with GzipFileHandler(gzip_file, "rt", encoding="utf-8") as f:
+        assert f.read() == ""
+
+    # Large file (binary)
+    large_data = b"x" * 1024 * 1024  # 1MB
+    with GzipFileHandler(gzip_file, "wb") as f:
+        f.write(large_data)
+    with GzipFileHandler(gzip_file, "rb") as f:
+        assert f.read() == large_data
+
+    # Invalid mode
+    for bad_mode in ["a", "x", "r+", "w+", ""]:
+        with pytest.raises(NotImplementedError):
+            with GzipFileHandler(gzip_file, bad_mode) as f:
+                raise AssertionError(f"Expected NotImplementedError for mode {bad_mode}")
+
+    # Double close (should not raise)
+    handler = GzipFileHandler(gzip_file, "rb")
+    f = handler.__enter__()
+    f.read()
+    handler.__exit__(None, None, None)
+    handler.__exit__(None, None, None)
+
+    # Exception inside context manager (should still close)
+    class CustomError(Exception):
+        pass
+
+    try:
+        with GzipFileHandler(gzip_file, "rb") as f:
+            raise CustomError("test")
+    except CustomError:
+        pass
+
+    # Invalid encoding
+    with pytest.raises(LookupError):
+        with GzipFileHandler(gzip_file, "wt", encoding="not-an-encoding") as f:
+            f.write("fail")
+
+    # S3 network error (simulate by using a non-existent bucket)
+    if base_path.startswith("s3://"):
+        bad_s3_file = "s3://nonexistent-bucket/edge.gz"
+        with pytest.raises(PermissionError):
+            with GzipFileHandler(bad_s3_file, "wb") as f:
+                f.write(b"fail")
+        with pytest.raises(FileNotFoundError):
+            with GzipFileHandler(bad_s3_file, "rb") as f:
+                f.read()
 
 
 def test_update_file(tmp_path: Path) -> None:
