@@ -19,6 +19,8 @@ TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR TH
 
 import gzip
 import os
+import urllib.error
+import urllib.request
 from contextlib import contextmanager
 from datetime import datetime
 from glob import glob
@@ -27,7 +29,6 @@ from shutil import copyfile
 from typing import IO, Any, Dict, Generator, List, Literal, Tuple, cast
 
 import boto3
-import requests
 from botocore.config import Config
 
 boto_config = Config(
@@ -82,10 +83,11 @@ def read_file(file: str) -> str:
             raise FileNotFoundError(f"File {file} not found") from exc
     elif file.startswith("https://"):
         try:
-            resp = requests.get(file)
-            resp.raise_for_status()
-            return resp.content.decode("utf-8")
-        except requests.RequestException as exc:
+            with urllib.request.urlopen(file) as resp:
+                if resp.status != 200:  # pragma: no cover
+                    raise FileNotFoundError(f"HTTPS file {file} returned status {resp.status}")
+                return str(resp.read().decode("utf-8"))
+        except urllib.error.URLError as exc:
             raise FileNotFoundError(f"HTTPS file {file} could not be read: {exc}") from exc
     else:
         with open(file, mode="r", encoding="UTF-8") as file_io:
@@ -299,11 +301,12 @@ class BinaryFileHandler:
         """Read from S3, HTTPS, or open the stream"""
         if self.is_https:
             try:
-                resp = requests.get(self.path, stream=True)
-                resp.raise_for_status()
-                self._buffer = BytesIO(resp.content)
-                self._buffer.seek(0)
-            except requests.RequestException as exc:
+                with urllib.request.urlopen(self.path) as resp:
+                    if resp.status != 200:  # pragma: no cover
+                        raise FileNotFoundError(f"HTTPS file {self.path} returned status {resp.status}")
+                    self._buffer = BytesIO(resp.read())
+                    self._buffer.seek(0)
+            except urllib.error.URLError as exc:
                 raise FileNotFoundError(f"HTTPS file {self.path} could not be read: {exc}") from exc
             return self._buffer
 
