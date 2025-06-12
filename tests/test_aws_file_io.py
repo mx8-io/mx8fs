@@ -211,6 +211,59 @@ def test_s3_public_url() -> None:
     delete_file(s3_file)
 
 
+def test_https_binary_file_handler() -> None:
+    """Test BinaryFileHandler with https:// URLs (read-only) and edge cases."""
+    s3_file = f"s3://{TEST_BUCKET_NAME}/test_https.txt"
+    test_data = b"https test data"
+    # Write to S3 and get public URL
+    with BinaryFileHandler(s3_file, "wb") as f:
+        f.write(test_data)
+    https_url = get_public_url(s3_file)
+    # Read from HTTPS using BinaryFileHandler
+    with BinaryFileHandler(https_url, "rb") as f:
+        assert f.read() == test_data
+    # Attempt to open in write mode (should fail)
+    with pytest.raises(NotImplementedError):
+        with BinaryFileHandler(https_url, "wb") as f:
+            raise AssertionError("Expected NotImplementedError")
+    # Attempt to open in text mode (should fail)
+    with pytest.raises(NotImplementedError):
+        with BinaryFileHandler(https_url, "r") as f:
+            raise AssertionError("Expected NotImplementedError")
+    # Edge case: 404 URL
+    bad_url = https_url + ".notfound"
+    with pytest.raises(FileNotFoundError):
+        with BinaryFileHandler(bad_url, "rb") as f:
+            f.read()
+    # Edge case: invalid URL
+    with pytest.raises(FileNotFoundError):
+        with BinaryFileHandler("https://invalid.invaliddomain/test.txt", "rb") as f:
+            f.read()
+    # Clean up
+    delete_file(s3_file)
+
+
+def test_https_read_file() -> None:
+    """Test read_file with https:// URLs and edge cases."""
+    s3_file = f"s3://{TEST_BUCKET_NAME}/test_https_read.txt"
+    test_data = "https read test data"
+    # Write to S3 and get public URL
+    with BinaryFileHandler(s3_file, "wb") as f:
+        f.write(test_data.encode("utf-8"))
+    https_url = get_public_url(s3_file)
+    # Read from HTTPS using read_file
+    assert read_file(https_url) == test_data
+    # Edge case: 404 URL
+    bad_url = https_url + ".notfound"
+    with pytest.raises(FileNotFoundError):
+        read_file(bad_url)
+    # Edge case: invalid URL
+    with pytest.raises(FileNotFoundError):
+        read_file("https://invalid.invaliddomain/test.txt")
+    # Clean up
+    delete_file(s3_file)
+
+
 def test_copy_file(tmp_path: Path) -> None:
     """Test the copy_file function"""
 
