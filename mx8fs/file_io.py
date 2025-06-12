@@ -17,12 +17,14 @@ OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHE
 TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 """
 
+import gzip
 import os
+from contextlib import contextmanager
 from datetime import datetime
 from glob import glob
 from io import BytesIO
 from shutil import copyfile
-from typing import IO, Any, Dict, List, Literal, Tuple, cast
+from typing import IO, Any, Dict, Generator, List, Literal, Tuple, cast
 
 import boto3
 from botocore.config import Config
@@ -42,6 +44,8 @@ s3_client = boto3.client(
     config=boto_config,
 )
 
+S3_PREFIX = "s3://"
+
 
 class VersionMismatchError(FileNotFoundError):
     """Custom error for version mismatch when writing files"""
@@ -49,14 +53,14 @@ class VersionMismatchError(FileNotFoundError):
 
 def get_bucket_key(path: str) -> Tuple[str, str]:
     """Get the bucket and key from a S3 path"""
-    path = path.replace("s3://", "")
+    path = path.replace(S3_PREFIX, "")
     bucket, key = path.split("/", 1)
     return bucket, key
 
 
 def file_exists(file: str) -> bool:
     """Check if a file exists on S3 or local storage"""
-    if file.startswith("s3://"):
+    if file.startswith(S3_PREFIX):
         bucket, key = get_bucket_key(file)
         try:
             s3_client.head_object(Bucket=bucket, Key=key)
@@ -69,7 +73,7 @@ def file_exists(file: str) -> bool:
 
 def read_file(file: str) -> str:
     """Read a file from S3 or local storage with UTF-8 encoding"""
-    if file.startswith("s3://"):
+    if file.startswith(S3_PREFIX):
         bucket, key = get_bucket_key(file)
         try:
             return str(s3_client.get_object(Bucket=bucket, Key=key)["Body"].read().decode("utf-8"))
@@ -89,7 +93,7 @@ def read_file_with_version(file: str) -> Tuple[str, str]:
     :param file: The file to read
     :return: The file contents and the version identifier
     """
-    if file.startswith("s3://"):
+    if file.startswith(S3_PREFIX):
         bucket, key = get_bucket_key(file)
         try:
             response = s3_client.get_object(Bucket=bucket, Key=key)
@@ -104,7 +108,7 @@ def read_file_with_version(file: str) -> Tuple[str, str]:
 
 def write_file(file: str, data: str) -> None:
     """Write a file to S3 or local storage with UTF-8 encoding"""
-    if file.startswith("s3://"):
+    if file.startswith(S3_PREFIX):
         bucket, key = get_bucket_key(file)
         s3_client.put_object(Bucket=bucket, Key=key, Body=data.encode("UTF-8"))
     else:
@@ -122,7 +126,7 @@ def update_file_if_version_matches(file: str, data: str, version: str) -> None:
     :param file: The file to write
     :param data: The data to write
     """
-    if file.startswith("s3://"):
+    if file.startswith(S3_PREFIX):
         bucket, key = get_bucket_key(file)
         try:
             s3_client.put_object(Bucket=bucket, Key=key, Body=data.encode("UTF-8"), IfMatch=version)
@@ -151,7 +155,7 @@ def update_file_if_version_matches(file: str, data: str, version: str) -> None:
 
 def delete_file(file: str) -> None:
     """Delete a file from S3 or local storage"""
-    if file.startswith("s3://"):
+    if file.startswith(S3_PREFIX):
         bucket, key = get_bucket_key(file)
         s3_client.delete_object(Bucket=bucket, Key=key)
     else:
@@ -164,7 +168,7 @@ def delete_file(file: str) -> None:
 
 def copy_file(src: str, dst: str) -> None:
     """Copy a file from S3 or local storage"""
-    if src.startswith("s3://"):
+    if src.startswith(S3_PREFIX):
         src_bucket, src_key = get_bucket_key(src)
         dst_bucket, dst_key = get_bucket_key(dst)
 
@@ -192,7 +196,7 @@ def list_files(root_path: str, file_type: str, prefix: str = "") -> List[str]:
 
     The prefix signficantly improves performance for S3 by reducing the number of objects listed.
     """
-    if root_path.startswith("s3://"):
+    if root_path.startswith(S3_PREFIX):
         bucket, key = get_bucket_key(root_path)
         key = key + "/" if not key.endswith("/") else key
 
@@ -215,7 +219,7 @@ def list_files(root_path: str, file_type: str, prefix: str = "") -> List[str]:
 
 def most_recent_timestamp(root_path: str, file_type: str) -> float:
     """Returns the most recent timestamp from S3 or local storage with the suffix"""
-    if root_path.startswith("s3://"):
+    if root_path.startswith(S3_PREFIX):
         bucket, key = get_bucket_key(root_path)
         boto_response = s3_client.list_objects_v2(Bucket=bucket, Prefix=key, Delimiter="/")
         if "Contents" not in boto_response:
@@ -235,7 +239,7 @@ def most_recent_timestamp(root_path: str, file_type: str) -> float:
 def get_public_url(file: str, expires_in: int = 3600) -> str:
     """Get a signed URL for a file on S3"""
 
-    if file.startswith("s3://"):
+    if file.startswith(S3_PREFIX):
         bucket, key = get_bucket_key(file)
         presigned_url = s3_client.generate_presigned_url(
             ClientMethod="get_object",
@@ -267,7 +271,7 @@ class BinaryFileHandler:
         self.path = path
         self.mode = mode
         self.content_type = content_type
-        self.is_s3 = path.startswith("s3://")
+        self.is_s3 = path.startswith(S3_PREFIX)
 
         if self.is_s3:
             self._buffer = BytesIO()
@@ -296,10 +300,31 @@ class BinaryFileHandler:
         if self.is_s3 and self.mode == "wb":
             self._buffer.seek(0)
             bucket, key = get_bucket_key(self.path)
-            s3_client.upload_fileobj(
-                Fileobj=self._buffer,
-                Bucket=bucket,
-                Key=key,
-                ExtraArgs=({"ContentType": self.content_type} if self.content_type else None),
-            )
+            try:
+                s3_client.upload_fileobj(
+                    Fileobj=self._buffer,
+                    Bucket=bucket,
+                    Key=key,
+                    ExtraArgs=({"ContentType": self.content_type} if self.content_type else None),
+                )
+            except s3_client.exceptions.ClientError as exc:
+                raise PermissionError(f"Cannot write to {self.path}.") from exc
         self._buffer.close()
+
+
+@contextmanager
+def GzipFileHandler(path: str, mode: str = "rb", encoding: str | None = None) -> Generator[Any, Any, None]:  # NOSONAR
+    """
+    Context manager for reading/writing gzip-compressed files from S3 or local storage,
+    using BinaryFileHandler for the underlying file I/O.
+    Supports binary ('rb', 'wb') and text ('rt', 'wt') modes.
+    Usage:
+        with GzipFileHandler(path, mode, encoding='utf-8') as f:
+            f.read() / f.write(...)
+    """
+    if mode not in ("rb", "wb", "rt", "wt"):
+        raise NotImplementedError(f"mode {mode} is not supported")
+    file_mode = mode.replace("t", "b")
+    with BinaryFileHandler(path, file_mode) as base_file:
+        with gzip.open(base_file, mode, encoding=encoding) as gz_file:
+            yield gz_file
