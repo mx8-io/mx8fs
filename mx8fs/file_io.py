@@ -27,6 +27,7 @@ from shutil import copyfile
 from typing import IO, Any, Dict, Generator, List, Literal, Tuple, cast
 
 import boto3
+import requests
 from botocore.config import Config
 
 boto_config = Config(
@@ -72,13 +73,20 @@ def file_exists(file: str) -> bool:
 
 
 def read_file(file: str) -> str:
-    """Read a file from S3 or local storage with UTF-8 encoding"""
+    """Read a file from S3, HTTPS, or local storage with UTF-8 encoding"""
     if file.startswith(S3_PREFIX):
         bucket, key = get_bucket_key(file)
         try:
             return str(s3_client.get_object(Bucket=bucket, Key=key)["Body"].read().decode("utf-8"))
         except s3_client.exceptions.NoSuchKey as exc:
             raise FileNotFoundError(f"File {file} not found") from exc
+    elif file.startswith("https://"):
+        try:
+            resp = requests.get(file)
+            resp.raise_for_status()
+            return resp.content.decode("utf-8")
+        except requests.RequestException as exc:
+            raise FileNotFoundError(f"HTTPS file {file} could not be read: {exc}") from exc
     else:
         with open(file, mode="r", encoding="UTF-8") as file_io:
             return file_io.read()
@@ -253,7 +261,7 @@ def get_public_url(file: str, expires_in: int = 3600) -> str:
 
 
 class BinaryFileHandler:
-    """File handler for S3 or local storage"""
+    """File handler for S3, local storage, or HTTPS (read-only)"""
 
     _buffer: IO[Any]
 
@@ -263,6 +271,7 @@ class BinaryFileHandler:
 
         For S3, returns a BytesIO object for writing, and downloads the file
         For local storage, returns a file object
+        For HTTPS, supports read-only ("rb") mode and fetches the file via HTTP(S)
         """
 
         if mode not in ["rb", "wb"]:
@@ -272,8 +281,13 @@ class BinaryFileHandler:
         self.mode = mode
         self.content_type = content_type
         self.is_s3 = path.startswith(S3_PREFIX)
+        self.is_https = path.startswith("https://")
 
-        if self.is_s3:
+        if self.is_https:
+            if self.mode != "rb":
+                raise NotImplementedError("Only 'rb' mode is supported for https:// paths")
+            self._buffer = BytesIO()
+        elif self.is_s3:
             self._buffer = BytesIO()
         else:
             os.makedirs(os.path.dirname(self.path), exist_ok=True)
@@ -282,7 +296,17 @@ class BinaryFileHandler:
             )
 
     def __enter__(self) -> BytesIO | IO:
-        """Read from S3 and open the stream"""
+        """Read from S3, HTTPS, or open the stream"""
+        if self.is_https:
+            try:
+                resp = requests.get(self.path, stream=True)
+                resp.raise_for_status()
+                self._buffer = BytesIO(resp.content)
+                self._buffer.seek(0)
+            except requests.RequestException as exc:
+                raise FileNotFoundError(f"HTTPS file {self.path} could not be read: {exc}") from exc
+            return self._buffer
+
         if self.is_s3:
             bucket, key = get_bucket_key(self.path)
             if self.mode == "rb":
@@ -297,6 +321,9 @@ class BinaryFileHandler:
 
     def __exit__(self, *_: List[Any], **__: Dict[str, Any]) -> None:
         """Write to S3 or local storage and close the stream"""
+        if self.is_https and self._buffer:
+            self._buffer.close()
+
         if self.is_s3 and self.mode == "wb":
             self._buffer.seek(0)
             bucket, key = get_bucket_key(self.path)
