@@ -30,6 +30,7 @@ from typing import IO, Any, Dict, Generator, List, Literal, Tuple, cast
 
 import boto3
 from botocore.config import Config
+from urllib3 import HTTPResponse
 
 boto_config = Config(
     max_pool_connections=int(os.getenv("BOTO_MAX_CONNECTIONS", 50)),
@@ -73,6 +74,18 @@ def file_exists(file: str) -> bool:
     return os.path.exists(file)
 
 
+@contextmanager
+def _get_response(url: str) -> Generator[HTTPResponse, None, None]:
+    """Read a file from HTTPS with UTF-8 encoding"""
+    try:
+        with urllib.request.urlopen(url) as resp:
+            if resp.status != 200:  # pragma: no cover
+                raise FileNotFoundError(f"HTTPS file {url} returned status {resp.status}")
+            yield resp
+    except urllib.error.URLError as exc:
+        raise FileNotFoundError(f"HTTPS file {url} could not be read: {exc}") from exc
+
+
 def read_file(file: str) -> str:
     """Read a file from S3, HTTPS, or local storage with UTF-8 encoding"""
     if file.startswith(S3_PREFIX):
@@ -82,13 +95,8 @@ def read_file(file: str) -> str:
         except s3_client.exceptions.NoSuchKey as exc:
             raise FileNotFoundError(f"File {file} not found") from exc
     elif file.startswith("https://"):
-        try:
-            with urllib.request.urlopen(file) as resp:
-                if resp.status != 200:  # pragma: no cover
-                    raise FileNotFoundError(f"HTTPS file {file} returned status {resp.status}")
-                return str(resp.read().decode("utf-8"))
-        except urllib.error.URLError as exc:
-            raise FileNotFoundError(f"HTTPS file {file} could not be read: {exc}") from exc
+        with _get_response(file) as response:
+            return str(response.read().decode("utf-8"))
     else:
         with open(file, mode="r", encoding="UTF-8") as file_io:
             return file_io.read()
@@ -300,15 +308,9 @@ class BinaryFileHandler:
     def __enter__(self) -> BytesIO | IO:
         """Read from S3, HTTPS, or open the stream"""
         if self.is_https:
-            try:
-                with urllib.request.urlopen(self.path) as resp:
-                    if resp.status != 200:  # pragma: no cover
-                        raise FileNotFoundError(f"HTTPS file {self.path} returned status {resp.status}")
-                    self._buffer = BytesIO(resp.read())
-                    self._buffer.seek(0)
-            except urllib.error.URLError as exc:
-                raise FileNotFoundError(f"HTTPS file {self.path} could not be read: {exc}") from exc
-            return self._buffer
+            with _get_response(self.path) as response:
+                self._buffer = BytesIO(response.read())
+            self._buffer.seek(0)
 
         if self.is_s3:
             bucket, key = get_bucket_key(self.path)
@@ -324,9 +326,6 @@ class BinaryFileHandler:
 
     def __exit__(self, *_: List[Any], **__: Dict[str, Any]) -> None:
         """Write to S3 or local storage and close the stream"""
-        if self.is_https and self._buffer:
-            self._buffer.close()
-
         if self.is_s3 and self.mode == "wb":
             self._buffer.seek(0)
             bucket, key = get_bucket_key(self.path)
