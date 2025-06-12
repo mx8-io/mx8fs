@@ -222,7 +222,6 @@ def test_copy_file(tmp_path: Path) -> None:
         delete_file(src_file)
         with pytest.raises(FileNotFoundError):
             copy_file(src_file, dst_file)
-            raise AssertionError("Expected FileNotFoundError")
 
         # Copy a file that exists
         write_file(src_file, "test 2")
