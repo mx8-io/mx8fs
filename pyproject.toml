@@ -53,6 +53,7 @@ addopts = [
     "--tb=short",
 ]
 asyncio_default_fixture_loop_scope = "function"
+filterwarnings = "error:::mx8fs"
 
 [tool.black]
 line-length = 120

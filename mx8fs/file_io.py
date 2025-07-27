@@ -209,10 +209,10 @@ def move_file(src: str, dst: str) -> None:
     delete_file(src)
 
 
-def list_files(root_path: str, file_type: str, prefix: str = "") -> List[str]:
-    """Returns a list of files from S3 or local storage with the relevant suffix and optional prefix.
+def get_files(root_path: str, prefix: str = "") -> List[str]:
+    """Returns a list of files from S3 or local storage with the relevant prefix.
 
-    The prefix signficantly improves performance for S3 by reducing the number of objects listed.
+    The prefix significantly improves performance for S3 by reducing the number of objects listed.
     """
     if root_path.startswith(S3_PREFIX):
         bucket, key = get_bucket_key(root_path)
@@ -223,15 +223,20 @@ def list_files(root_path: str, file_type: str, prefix: str = "") -> List[str]:
 
         for page in paginator.paginate(Bucket=bucket, Prefix=key + prefix, PaginationConfig={"PageSize": 10_000}):
             if "Contents" in page:
-                files.extend(
-                    [
-                        obj["Key"].removeprefix(key).removesuffix(f".{file_type}")
-                        for obj in page["Contents"]
-                        if obj["Key"].endswith(file_type)
-                    ]
-                )
+                files.extend([obj["Key"].removeprefix(key) for obj in page["Contents"]])
 
         return files
+
+    return [os.path.split(f)[1] for f in glob(os.path.join(root_path, f"{prefix}*.*"))]
+
+
+def list_files(root_path: str, file_type: str, prefix: str = "") -> List[str]:
+    """Returns a list of files from S3 or local storage with the relevant suffix and optional prefix.
+
+    The prefix significantly improves performance for S3 by reducing the number of objects listed.
+    """
+    if root_path.startswith(S3_PREFIX):
+        return [f.removesuffix(f".{file_type}") for f in get_files(root_path, prefix) if f.endswith(f".{file_type}")]
     return [os.path.split(f)[1][: -len(file_type) - 1] for f in glob(os.path.join(root_path, f"{prefix}*.{file_type}"))]
 
 

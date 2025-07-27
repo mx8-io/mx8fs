@@ -41,6 +41,7 @@ from mx8fs import (
     update_file_if_version_matches,
     write_file,
 )
+from mx8fs.file_io import get_files
 
 TEST_BUCKET_NAME = "s3://mx8-test-bucket/mx8fs"
 
@@ -116,6 +117,9 @@ def _test_list_files(path: str) -> None:
 
     assert len(list_files(path, "txt", "test1")) == 1
     assert len(list_files(path, "txt", "notest")) == 0
+
+    assert len(get_files(path, "test1")) == 1
+    assert len(get_files(path, "notest")) == 0
 
     # Delete the files
     delete_file(os.path.join(path, TEST_FILE_1))
