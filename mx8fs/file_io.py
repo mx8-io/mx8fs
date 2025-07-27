@@ -233,7 +233,7 @@ def get_files(root_path: str, prefix: str = "") -> List[str]:
 def list_files(root_path: str, file_type: str, prefix: str = "") -> List[str]:
     """Returns a list of files from S3 or local storage with the relevant suffix and optional prefix.
 
-    The prefix signficantly improves performance for S3 by reducing the number of objects listed.
+    The prefix significantly improves performance for S3 by reducing the number of objects listed.
     """
     if root_path.startswith(S3_PREFIX):
         return [f.removesuffix(f".{file_type}") for f in get_files(root_path, prefix) if f.endswith(f".{file_type}")]
