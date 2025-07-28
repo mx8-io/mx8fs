@@ -259,13 +259,13 @@ def most_recent_timestamp(root_path: str, file_type: str) -> float:
     )
 
 
-def get_public_url(file: str, expires_in: int = 3600) -> str:
+def get_public_url(file: str, expires_in: int = 3600, method: str = "get_object") -> str:
     """Get a signed URL for a file on S3"""
 
     if file.startswith(S3_PREFIX):
         bucket, key = get_bucket_key(file)
         presigned_url = s3_client.generate_presigned_url(
-            ClientMethod="get_object",
+            ClientMethod=method,
             Params={"Bucket": bucket, "Key": key},
             ExpiresIn=expires_in,
         )
