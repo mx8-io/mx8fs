@@ -25,7 +25,6 @@ from contextlib import contextmanager
 from datetime import datetime
 from glob import glob
 from io import BytesIO
-from shutil import copyfile
 from typing import IO, Any, Dict, Generator, List, Literal, Tuple, cast
 
 import boto3
@@ -184,9 +183,9 @@ def delete_file(file: str) -> None:
             pass
 
 
-def copy_file(src: str, dst: str) -> None:
+def copy_file(src: str, dst: str, chunk_size: int = 131072) -> None:
     """Copy a file from S3 or local storage"""
-    if src.startswith(S3_PREFIX):
+    if src.startswith(S3_PREFIX) and dst.startswith(S3_PREFIX):
         src_bucket, src_key = get_bucket_key(src)
         dst_bucket, dst_key = get_bucket_key(dst)
 
@@ -199,8 +198,13 @@ def copy_file(src: str, dst: str) -> None:
         except s3_client.exceptions.NoSuchKey as exc:
             raise FileNotFoundError(f"File {src} not found") from exc
     else:
-        os.makedirs(os.path.dirname(dst), exist_ok=True)
-        copyfile(src, dst)
+        with BinaryFileHandler(src, "rb") as original_file:
+            with BinaryFileHandler(dst, "wb") as new_file:
+                while True:
+                    chunk = original_file.read(chunk_size)
+                    if not chunk:
+                        break
+                    new_file.write(chunk)
 
 
 def move_file(src: str, dst: str) -> None:

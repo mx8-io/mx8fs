@@ -202,16 +202,51 @@ def test_s3() -> None:
     _test_most_recent_timestamp(f"s3://{TEST_BUCKET_NAME}/test_path/")
 
 
-def test_s3_public_url() -> None:
+def test_s3_public_url_get_then_put() -> None:
     """Test the S3 public URLs"""
-    s3_file = f"s3://{TEST_BUCKET_NAME}/test.txt"
+    s3_file = f"s3://{TEST_BUCKET_NAME}/test_get_then_put.txt"
 
     with BinaryFileHandler(s3_file, "wb", content_type="application/json") as f:
         f.write(b"test")
-    response = _fetch_url(get_public_url(s3_file))
-    assert response.status == 200
-    assert response.data == b"test"
-    assert response.headers["Content-Type"] == "application/json"
+    get_url = get_public_url(s3_file)
+
+    get_response = _fetch_url(get_url)
+    assert get_response.status == 200
+    assert get_response.data == b"test"
+    assert get_response.headers["Content-Type"] == "application/json"
+
+    put_url = get_public_url(s3_file, method="put_object")
+    assert put_url != get_url  # Ensure PUT URL is different
+
+    http = urllib3.PoolManager()
+    put_response = http.request("PUT", put_url, body=b"test_put", headers={"Content-Type": "application/json"})
+    assert put_response.status == 200
+
+    get_response = _fetch_url(get_url)
+    assert get_response.status == 200
+    assert get_response.data == b"test_put"
+
+    delete_file(s3_file)
+
+
+def test_s3_public_url_put_then_get() -> None:
+    """Test the S3 public URLs"""
+    s3_file = f"s3://{TEST_BUCKET_NAME}/test_put_then_get.txt"
+
+    put_url = get_public_url(s3_file, method="put_object")
+    http = urllib3.PoolManager()
+    put_response = http.request("PUT", put_url, body=b"test_put", headers={"Content-Type": "application/json"})
+    assert put_response.status == 200
+
+    get_url = get_public_url(s3_file)
+
+    get_response = _fetch_url(get_url)
+    assert get_response.status == 200
+    assert get_response.data == b"test_put"
+    assert get_response.headers["Content-Type"] == "application/json"
+
+    assert put_url != get_url  # Ensure PUT URL is different
+
     delete_file(s3_file)
 
 
