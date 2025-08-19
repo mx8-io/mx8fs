@@ -366,3 +366,31 @@ def GzipFileHandler(path: str, mode: str = "rb", encoding: str | None = None) ->
     with BinaryFileHandler(path, file_mode) as base_file:
         with gzip.open(base_file, mode, encoding=encoding) as gz_file:
             yield gz_file
+
+
+def purge_folder(root_path: str, dry_run: bool = True) -> List[str]:
+    """Delete all files within a folder/prefix on S3 or a local directory.
+
+    For S3, root_path should be an S3 URL (s3://bucket/path/). Uses get_files to list objects
+    under the prefix. For local paths, the function walks the directory tree recursively.
+    If dry_run is True (default), no deletion is performed and the function returns the
+    list of files that would be deleted.
+    Returns a sorted list of full paths of files deleted (or that would be deleted).
+    """
+    if root_path.startswith(S3_PREFIX):
+        # S3: get_files already returns all keys under the prefix (relative to the prefix)
+        files = get_files(root_path)
+        full_paths = [f"{root_path.rstrip('/')}/{f}" for f in files]
+    else:
+        # Local: walk the directory tree recursively to collect all files
+        all_files: List[str] = []
+        for dirpath, _, filenames in os.walk(root_path):
+            for name in filenames:
+                all_files.append(os.path.join(dirpath, name))
+        full_paths = all_files
+
+    full_paths.sort()
+    if not dry_run:
+        for path in full_paths:
+            delete_file(path)
+    return full_paths
