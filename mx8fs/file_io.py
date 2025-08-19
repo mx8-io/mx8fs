@@ -22,7 +22,7 @@ import os
 import urllib.error
 import urllib.request
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 from glob import glob
 from io import BytesIO
 from typing import IO, Any, Dict, Generator, List, Literal, Tuple, cast
@@ -231,7 +231,14 @@ def get_files(root_path: str, prefix: str = "") -> List[str]:
 
         return files
 
-    return [os.path.split(f)[1] for f in glob(os.path.join(root_path, f"{prefix}*.*"))]
+    root_path = os.path.abspath(root_path)
+    results: List[str] = []
+    for dirpath, _, filenames in os.walk(root_path):
+        for name in filenames:
+            rel = os.path.relpath(os.path.join(dirpath, name), root_path)
+            if rel.startswith(prefix):
+                results.append(rel)
+    return results
 
 
 def list_files(root_path: str, file_type: str, prefix: str = "") -> List[str]:
@@ -246,16 +253,22 @@ def list_files(root_path: str, file_type: str, prefix: str = "") -> List[str]:
 
 def most_recent_timestamp(root_path: str, file_type: str) -> float:
     """Returns the most recent timestamp from S3 or local storage with the suffix"""
-    if root_path.startswith(S3_PREFIX):
-        bucket, key = get_bucket_key(root_path)
-        boto_response = s3_client.list_objects_v2(Bucket=bucket, Prefix=key, Delimiter="/")
-        if "Contents" not in boto_response:
-            return 0
 
-        return max(
-            [obj["LastModified"] for obj in boto_response["Contents"] if obj["Key"].endswith(file_type)],
-            default=datetime(1970, 1, 1),
-        ).timestamp()
+    if root_path.startswith(S3_PREFIX):
+        default = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+        def _get_timestamps() -> Generator[datetime, Any, None]:
+            """Get the max timestamp on each page in the paginator"""
+            paginator = s3_client.get_paginator("list_objects_v2")
+            bucket, key = get_bucket_key(root_path)
+            for page in paginator.paginate(Bucket=bucket, Prefix=key, Delimiter="/"):
+                if "Contents" in page:
+                    yield max(
+                        [obj["LastModified"] for obj in page["Contents"] if obj["Key"].endswith(file_type)],
+                        default=default,
+                    )
+
+        return max(_get_timestamps(), default=default).timestamp()
 
     return max(
         [os.path.getmtime(f) for f in glob(os.path.join(root_path, f"*.{file_type}"))],
@@ -366,3 +379,20 @@ def GzipFileHandler(path: str, mode: str = "rb", encoding: str | None = None) ->
     with BinaryFileHandler(path, file_mode) as base_file:
         with gzip.open(base_file, mode, encoding=encoding) as gz_file:
             yield gz_file
+
+
+def purge_folder(root_path: str, dry_run: bool = True) -> List[str]:
+    """Delete all files within a folder/prefix on S3 or a local directory.
+
+    For S3, root_path should be an S3 URL (s3://bucket/path/). Uses get_files to list objects
+    under the prefix. For local paths, the function walks the directory tree recursively.
+    If dry_run is True (default), no deletion is performed and the function returns the
+    list of files that would be deleted.
+    Returns a sorted list of full paths of files deleted (or that would be deleted).
+    """
+    full_paths = sorted(f"{root_path.rstrip('/')}/{f}" for f in get_files(root_path))
+
+    if not dry_run:
+        for path in full_paths:
+            delete_file(path)
+    return full_paths

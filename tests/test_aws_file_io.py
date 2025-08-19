@@ -41,9 +41,9 @@ from mx8fs import (
     update_file_if_version_matches,
     write_file,
 )
-from mx8fs.file_io import get_files
+from mx8fs.file_io import get_files, purge_folder
 
-TEST_BUCKET_NAME = "s3://mx8-test-bucket/mx8fs"
+TEST_BUCKET_NAME = "mx8-test-bucket/mx8fs"
 
 
 def _test_read_file(file: str) -> None:
@@ -105,6 +105,8 @@ TEST_FILE_2 = "test2.txt"
 def _test_list_files(path: str) -> None:
     """Test the list_files function"""
     files = list_files(path, "txt")
+    for f in files:
+        delete_file(path + f + ".txt")
     assert len(files) == 0
 
     write_file(os.path.join(path, TEST_FILE_1), "test1")
@@ -498,3 +500,63 @@ def test_update_file(tmp_path: Path) -> None:
         assert read_file(test_file) == "test 3"
 
         delete_file(test_file)
+
+
+def test_purge_folder_local(tmp_path: Path) -> None:
+    root = str(tmp_path)
+    # Create nested directories
+    subdir = os.path.join(root, "sub")
+    os.makedirs(subdir, exist_ok=True)
+    f1 = os.path.join(root, "test1.txt")
+    f2 = os.path.join(subdir, "test2.txt")
+
+    # Create files
+    write_file(f1, "one")
+    write_file(f2, "two")
+
+    # Dry run should list files and not delete them
+    listed = purge_folder(root, dry_run=True)
+    assert set(listed) == {f1, f2}
+    assert file_exists(f1)
+    assert file_exists(f2)
+
+    # Perform deletion
+    deleted = purge_folder(root, dry_run=False)
+    assert set(deleted) == {f1, f2}
+    assert not file_exists(f1)
+    assert not file_exists(f2)
+
+    # Subsequent calls should return empty
+    assert purge_folder(root, dry_run=True) == []
+
+
+def test_purge_folder_s3() -> None:
+    root = f"s3://{TEST_BUCKET_NAME}/purge_test/"
+
+    f1 = os.path.join(root, "one.txt")
+    f2 = os.path.join(root, "two.txt")
+
+    # Ensure a clean state
+    delete_file(f1)
+    delete_file(f2)
+
+    # Create S3 objects
+    write_file(f1, "one")
+    write_file(f2, "two")
+
+    # Dry run should list the S3 paths and not delete
+    listed = purge_folder(root, dry_run=True)
+    # normalize expected paths (purge_folder constructs paths with root.rstrip('/')/<key>)
+    expected = {f1, f2}
+    assert set(listed) == expected
+    assert file_exists(f1)
+    assert file_exists(f2)
+
+    # Perform deletion
+    deleted = purge_folder(root, dry_run=False)
+    assert set(deleted) == expected
+    assert not file_exists(f1)
+    assert not file_exists(f2)
+
+    # Ensure no leftover objects
+    assert get_files(root) == []

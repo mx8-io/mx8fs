@@ -22,6 +22,7 @@ from .file_io import (
     list_files,
     most_recent_timestamp,
     move_file,
+    purge_folder,
     read_file,
     read_file_with_version,
     update_file_if_version_matches,
@@ -53,5 +54,6 @@ __all__ = [
     "update_file_if_version_matches",
     "VersionMismatchError",
     "Waiter",
+    "purge_folder",
     "write_file",
 ]
