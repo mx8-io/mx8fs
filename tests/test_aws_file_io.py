@@ -43,7 +43,7 @@ from mx8fs import (
 )
 from mx8fs.file_io import get_files, purge_folder
 
-TEST_BUCKET_NAME = "s3://mx8-test-bucket/mx8fs"
+TEST_BUCKET_NAME = "mx8-test-bucket/mx8fs"
 
 
 def _test_read_file(file: str) -> None:
@@ -105,6 +105,8 @@ TEST_FILE_2 = "test2.txt"
 def _test_list_files(path: str) -> None:
     """Test the list_files function"""
     files = list_files(path, "txt")
+    for f in files:
+        delete_file(path + f + ".txt")
     assert len(files) == 0
 
     write_file(os.path.join(path, TEST_FILE_1), "test1")

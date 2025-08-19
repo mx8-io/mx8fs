@@ -22,7 +22,7 @@ import os
 import urllib.error
 import urllib.request
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 from glob import glob
 from io import BytesIO
 from typing import IO, Any, Dict, Generator, List, Literal, Tuple, cast
@@ -231,7 +231,8 @@ def get_files(root_path: str, prefix: str = "") -> List[str]:
 
         return files
 
-    return [os.path.split(f)[1] for f in glob(os.path.join(root_path, f"{prefix}*.*"))]
+    pattern = os.path.join(root_path, "**", f"{prefix}*.*")
+    return [os.path.relpath(f, root_path) for f in glob(pattern, recursive=True)]
 
 
 def list_files(root_path: str, file_type: str, prefix: str = "") -> List[str]:
@@ -246,16 +247,22 @@ def list_files(root_path: str, file_type: str, prefix: str = "") -> List[str]:
 
 def most_recent_timestamp(root_path: str, file_type: str) -> float:
     """Returns the most recent timestamp from S3 or local storage with the suffix"""
-    if root_path.startswith(S3_PREFIX):
-        bucket, key = get_bucket_key(root_path)
-        boto_response = s3_client.list_objects_v2(Bucket=bucket, Prefix=key, Delimiter="/")
-        if "Contents" not in boto_response:
-            return 0
 
-        return max(
-            [obj["LastModified"] for obj in boto_response["Contents"] if obj["Key"].endswith(file_type)],
-            default=datetime(1970, 1, 1),
-        ).timestamp()
+    if root_path.startswith(S3_PREFIX):
+        default = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+        def _get_timestamps() -> Generator[datetime, Any, None]:
+            """Get the max timestamp on each page in the paginator"""
+            paginator = s3_client.get_paginator("list_objects_v2")
+            bucket, key = get_bucket_key(root_path)
+            for page in paginator.paginate(Bucket=bucket, Prefix=key, Delimiter="/"):
+                if "Contents" in page:
+                    yield max(
+                        [obj["LastModified"] for obj in page["Contents"] if obj["Key"].endswith(file_type)],
+                        default=default,
+                    )
+
+        return max(_get_timestamps(), default=default).timestamp()
 
     return max(
         [os.path.getmtime(f) for f in glob(os.path.join(root_path, f"*.{file_type}"))],
