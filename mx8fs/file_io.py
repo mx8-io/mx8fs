@@ -231,8 +231,14 @@ def get_files(root_path: str, prefix: str = "") -> List[str]:
 
         return files
 
-    pattern = os.path.join(root_path, "**", f"{prefix}*.*")
-    return [os.path.relpath(f, root_path) for f in glob(pattern, recursive=True)]
+    root_path = os.path.abspath(root_path)
+    results: List[str] = []
+    for dirpath, _, filenames in os.walk(root_path):
+        for name in filenames:
+            rel = os.path.relpath(os.path.join(dirpath, name), root_path)
+            if rel.startswith(prefix):
+                results.append(rel)
+    return results
 
 
 def list_files(root_path: str, file_type: str, prefix: str = "") -> List[str]:
@@ -384,19 +390,8 @@ def purge_folder(root_path: str, dry_run: bool = True) -> List[str]:
     list of files that would be deleted.
     Returns a sorted list of full paths of files deleted (or that would be deleted).
     """
-    if root_path.startswith(S3_PREFIX):
-        # S3: get_files already returns all keys under the prefix (relative to the prefix)
-        files = get_files(root_path)
-        full_paths = [f"{root_path.rstrip('/')}/{f}" for f in files]
-    else:
-        # Local: walk the directory tree recursively to collect all files
-        all_files: List[str] = []
-        for dirpath, _, filenames in os.walk(root_path):
-            for name in filenames:
-                all_files.append(os.path.join(dirpath, name))
-        full_paths = all_files
+    full_paths = sorted(f"{root_path.rstrip('/')}/{f}" for f in get_files(root_path))
 
-    full_paths.sort()
     if not dry_run:
         for path in full_paths:
             delete_file(path)
