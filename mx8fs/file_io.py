@@ -241,6 +241,57 @@ def get_files(root_path: str, prefix: str = "") -> List[str]:
     return results
 
 
+def _s3_get_folders(root_path: str, prefix: str = "") -> List[str]:
+    bucket, key = get_bucket_key(root_path)
+    # Ensure the key ends with a trailing slash for prefixing
+    key = key + "/" if not key.endswith("/") else key
+
+    paginator = s3_client.get_paginator("list_objects_v2")
+    folders: List[str] = []
+
+    # Use Delimiter='/' to obtain top-level "folders" (CommonPrefixes)
+    for page in paginator.paginate(
+        Bucket=bucket,
+        Prefix=(key + prefix) if prefix else key,
+        Delimiter="/",
+        PaginationConfig={"PageSize": 1000},
+    ):
+        if "CommonPrefixes" in page:
+            folders.extend([p["Prefix"].removeprefix(key).rstrip("/") for p in page["CommonPrefixes"]])
+
+    return folders
+
+
+def _local_get_folders(root_path: str, prefix: str = "") -> List[str]:
+    # Local filesystem: list immediate directories in root_path (non-recursive)
+    root_path = os.path.abspath(root_path)
+    if not os.path.isdir(root_path):
+        return []
+
+    results: List[str] = []
+    try:
+        for entry in os.listdir(root_path):
+            if prefix and not entry.startswith(prefix):
+                continue
+            full = os.path.join(root_path, entry)
+            if os.path.isdir(full):
+                results.append(entry)
+    except FileNotFoundError:
+        return []
+
+    return results
+
+
+def get_folders(root_path: str, prefix: str = "") -> List[str]:
+    """Returns a list of immediate subfolders from S3 or local storage with an optional prefix filter.
+
+    Non-recursive: only immediate children are returned (no nested folder paths).
+    """
+    if root_path.startswith(S3_PREFIX):
+        return _s3_get_folders(root_path, prefix)
+    return _local_get_folders(root_path, prefix)
+
+
 def list_files(root_path: str, file_type: str, prefix: str = "") -> List[str]:
     """Returns a list of files from S3 or local storage with the relevant suffix and optional prefix.
 

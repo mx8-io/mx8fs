@@ -32,6 +32,7 @@ from mx8fs import (
     copy_file,
     delete_file,
     file_exists,
+    get_folders,
     get_public_url,
     list_files,
     most_recent_timestamp,
@@ -560,3 +561,124 @@ def test_purge_folder_s3() -> None:
 
     # Ensure no leftover objects
     assert get_files(root) == []
+
+
+def test_get_folders_local(tmp_path: Path) -> None:
+    """Test get_folders on the local filesystem (non-recursive)."""
+    root = str(tmp_path)
+    a = os.path.join(root, "a")
+    os.makedirs(os.path.join(a, "sub"), exist_ok=True)
+    os.makedirs(os.path.join(root, "b"), exist_ok=True)
+
+    # Create files in the directories
+    write_file(os.path.join(a, "one.txt"), "one")
+    write_file(os.path.join(a, "sub", "two.txt"), "two")
+    write_file(os.path.join(root, "b", "three.txt"), "three")
+
+    folders = get_folders(root)
+    assert set(folders) == {"a", "b"}
+
+    # Clean up files
+    delete_file(os.path.join(a, "one.txt"))
+    delete_file(os.path.join(a, "sub", "two.txt"))
+    delete_file(os.path.join(root, "b", "three.txt"))
+
+
+def test_get_folders_s3() -> None:
+    """Test get_folders on S3 (non-recursive)."""
+    root = f"s3://{TEST_BUCKET_NAME}/folders_test/"
+
+    # Ensure a clean state
+    purge_folder(root, dry_run=False)
+
+    # Create S3 objects that imply folders
+    write_file(os.path.join(root, "a/one.txt"), "one")
+    write_file(os.path.join(root, "a/sub/two.txt"), "two")
+    write_file(os.path.join(root, "b/three.txt"), "three")
+
+    folders = get_folders(root)
+    assert set(folders) == {"a", "b"}
+
+    # Clean up S3 objects
+    purge_folder(root, dry_run=False)
+
+
+def test_get_folders_local_with_prefix(tmp_path: Path) -> None:
+    """Test get_folders on the local filesystem with a prefix filter (non-recursive)."""
+    root = str(tmp_path)
+    a = os.path.join(root, "a")
+    os.makedirs(os.path.join(a, "sub"), exist_ok=True)
+    os.makedirs(os.path.join(root, "b"), exist_ok=True)
+    write_file(os.path.join(a, "one.txt"), "one")
+    write_file(os.path.join(root, "b", "three.txt"), "three")
+
+    # prefix that matches 'a'
+    folders = get_folders(root, "a")
+    assert set(folders) == {"a"}
+
+    # prefix that matches none
+    assert get_folders(root, "nope") == []
+
+
+def test_get_folders_s3_with_prefix_and_empty() -> None:
+    """Test get_folders on S3 with a prefix filter and empty results (non-recursive)."""
+    root = f"s3://{TEST_BUCKET_NAME}/folders_test_prefix/"
+
+    # Ensure a clean state
+    purge_folder(root, dry_run=False)
+
+    # Create S3 objects that imply folders
+    write_file(os.path.join(root, "alpha/one.txt"), "one")
+    write_file(os.path.join(root, "alpha/beta/two.txt"), "two")
+    write_file(os.path.join(root, "bravo/three.txt"), "three")
+
+    # prefix that matches 'alpha'
+    folders = get_folders(root, "alpha")
+    assert set(folders) == {"alpha"}
+
+    # prefix that matches none should return empty list
+    assert get_folders(root, "nope") == []
+
+    # Ensure get_folders on an empty prefix (cleaned) returns []
+    purge_folder(root, dry_run=False)
+    assert get_folders(root) == []
+
+
+def test_get_folders_local_nonexistent(tmp_path: Path) -> None:
+    """get_folders should return an empty list for a non-existent local path."""
+    non_existent = os.path.join(str(tmp_path), "does_not_exist")
+    assert not os.path.exists(non_existent)
+    assert get_folders(non_existent) == []
+
+
+def test_get_folders_local_listdir_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """If os.listdir raises FileNotFoundError, get_folders should return an empty list."""
+    root = str(tmp_path)
+    os.makedirs(root, exist_ok=True)
+
+    # Simulate os.listdir raising FileNotFoundError for the created directory
+    original_listdir = os.listdir
+
+    def _raise(path: Path) -> None:
+        raise FileNotFoundError()
+
+    monkeypatch.setattr("os.listdir", _raise)
+    try:
+        assert get_folders(root) == []
+    finally:
+        # restore to be safe for other tests
+        monkeypatch.setattr("os.listdir", original_listdir)
+
+
+def test_get_folders_local_ignores_files(tmp_path: Path) -> None:
+    """get_folders should ignore files in the root directory and only return directories."""
+    root = str(tmp_path)
+    # Create a file at the root and a directory
+    write_file(os.path.join(root, "rootfile.txt"), "root")
+    os.makedirs(os.path.join(root, "dir_only"), exist_ok=True)
+
+    folders = get_folders(root)
+    assert set(folders) == {"dir_only"}
+
+    # Clean up
+    delete_file(os.path.join(root, "rootfile.txt"))
