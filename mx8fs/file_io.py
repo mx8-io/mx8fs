@@ -21,6 +21,7 @@ import gzip
 import os
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from glob import glob
@@ -183,6 +184,12 @@ def delete_file(file: str) -> None:
             pass
 
 
+def delete_files(files: list[str], max_workers: int = 500) -> None:
+    """Delete multiple files from S3 or local storage, using up to max_workers threads."""
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        executor.map(delete_file, files)
+
+
 def copy_file(src: str, dst: str, chunk_size: int = 131072) -> None:
     """Copy a file from S3 or local storage"""
     if src.startswith(S3_PREFIX) and dst.startswith(S3_PREFIX):
@@ -244,7 +251,7 @@ def get_files(root_path: str, prefix: str = "") -> List[str]:
 def _s3_get_folders(root_path: str, prefix: str = "") -> List[str]:
     bucket, key = get_bucket_key(root_path)
     # Ensure the key ends with a trailing slash for prefixing
-    key = key + "/" if not key.endswith("/") else key
+    key = key + "/" if key and not key.endswith("/") else key
 
     paginator = s3_client.get_paginator("list_objects_v2")
     folders: List[str] = []
@@ -432,18 +439,21 @@ def GzipFileHandler(path: str, mode: str = "rb", encoding: str | None = None) ->
             yield gz_file
 
 
-def purge_folder(root_path: str, dry_run: bool = True) -> List[str]:
+def purge_folder(root_path: str, dry_run: bool = True, max_workers: int = 500) -> List[str]:
     """Delete all files within a folder/prefix on S3 or a local directory.
 
     For S3, root_path should be an S3 URL (s3://bucket/path/). Uses get_files to list objects
     under the prefix. For local paths, the function walks the directory tree recursively.
     If dry_run is True (default), no deletion is performed and the function returns the
     list of files that would be deleted.
+    :param root_path: The S3 bucket/prefix or local directory to purge
+    :param dry_run: If True, no files are deleted, and the function returns the list of files that would be deleted
+    :param max_workers: The maximum number of worker threads to use for deletion
+
     Returns a sorted list of full paths of files deleted (or that would be deleted).
     """
     full_paths = sorted(f"{root_path.rstrip('/')}/{f}" for f in get_files(root_path))
 
     if not dry_run:
-        for path in full_paths:
-            delete_file(path)
+        delete_files(full_paths, max_workers=max_workers)
     return full_paths

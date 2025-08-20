@@ -680,5 +680,32 @@ def test_get_folders_local_ignores_files(tmp_path: Path) -> None:
     folders = get_folders(root)
     assert set(folders) == {"dir_only"}
 
-    # Clean up
-    delete_file(os.path.join(root, "rootfile.txt"))
+
+# Clean up
+def test_get_folders_s3_bucket_root() -> None:
+    """
+    Test get_folders on S3 at the root of the bucket (non-recursive).
+    Ensures folders at the bucket root are detected correctly.
+    """
+    # Use bucket root (no trailing slash)
+    bucket_root = f"s3://{TEST_BUCKET_NAME.split('/')[0]}/"
+
+    # Clean up any test folders at the root
+    for folder in ["root_a", "root_b"]:
+        purge_folder(os.path.join(bucket_root, folder), dry_run=False)
+
+    # Create S3 objects that imply folders at the root
+    write_file(os.path.join(bucket_root, "root_a/file1.txt"), "data1")
+    write_file(os.path.join(bucket_root, "root_b/file2.txt"), "data2")
+
+    folders = get_folders(bucket_root)
+    # Should find both folders at the root
+    assert set(folders) >= {"root_a", "root_b"}
+
+    # Clean up S3 objects
+    purge_folder(os.path.join(bucket_root, "root_a"), dry_run=False)
+    purge_folder(os.path.join(bucket_root, "root_b"), dry_run=False)
+
+    # Now confirm the folders are gone
+    folders = get_folders(bucket_root)
+    assert {"root_a", "root_b"}.isdisjoint(set(folders))
