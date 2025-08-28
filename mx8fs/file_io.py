@@ -238,12 +238,12 @@ def get_files(root_path: str, prefix: str = "") -> List[str]:
 
         return files
 
-    root_path = os.path.abspath(root_path)
+    root_path = os.path.abspath(os.path.normpath(root_path)) + os.path.sep
     results: List[str] = []
     for dirpath, _, filenames in os.walk(root_path):
         for name in filenames:
             rel = os.path.relpath(os.path.join(dirpath, name), root_path)
-            if rel.startswith(prefix):
+            if not prefix or rel.startswith(prefix):
                 results.append(rel)
     return results
 
@@ -452,8 +452,17 @@ def purge_folder(root_path: str, dry_run: bool = True, max_workers: int = 500) -
 
     Returns a sorted list of full paths of files deleted (or that would be deleted).
     """
-    full_paths = sorted(f"{root_path.rstrip('/')}/{f}" for f in get_files(root_path))
+    if root_path.startswith(S3_PREFIX):
+        full_paths = sorted(f"{root_path.rstrip('/')}/{f}" for f in get_files(root_path))
+    else:
+        full_paths = sorted(os.path.join(os.path.normpath(root_path), f) for f in get_files(root_path))
 
     if not dry_run:
         delete_files(full_paths, max_workers=max_workers)
+
+        if not root_path.startswith(S3_PREFIX):
+            # Clean up any subdirectories
+            for dirpath, _, _ in os.walk(root_path, topdown=False):
+                os.rmdir(dirpath)
+
     return full_paths
