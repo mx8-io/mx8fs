@@ -57,8 +57,10 @@ class VersionMismatchError(FileNotFoundError):
 def get_bucket_key(path: str) -> Tuple[str, str]:
     """Get the bucket and key from a S3 path"""
     path = path.replace(S3_PREFIX, "")
-    bucket, key = path.split("/", 1)
-    return bucket, key
+    if "/" in path:
+        bucket, key = path.split("/", 1)
+        return bucket, key
+    return path, ""
 
 
 def file_exists(file: str) -> bool:

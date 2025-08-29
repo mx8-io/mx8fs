@@ -42,7 +42,7 @@ from mx8fs import (
     update_file_if_version_matches,
     write_file,
 )
-from mx8fs.file_io import get_files, purge_folder
+from mx8fs.file_io import get_bucket_key, get_files, purge_folder
 
 TEST_BUCKET_NAME = "mx8-test-bucket/mx8fs"
 
@@ -709,3 +709,10 @@ def test_get_folders_s3_bucket_root() -> None:
     # Now confirm the folders are gone
     folders = get_folders(bucket_root)
     assert {"root_a", "root_b"}.isdisjoint(set(folders))
+
+
+def test_get_bucket_key() -> None:
+    """Test get_bucket_key with various S3 paths."""
+    assert get_bucket_key("s3://my-bucket/my-key") == ("my-bucket", "my-key")
+    assert get_bucket_key("s3://my-bucket/") == ("my-bucket", "")
+    assert get_bucket_key("s3://my-bucket") == ("my-bucket", "")
