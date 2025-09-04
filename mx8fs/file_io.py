@@ -186,10 +186,57 @@ def delete_file(file: str) -> None:
             pass
 
 
-def delete_files(files: list[str], max_workers: int = 500) -> None:
-    """Delete multiple files from S3 or local storage, using up to max_workers threads."""
+def _delete_files_s3(files: list[str], max_workers: int = 500) -> None:
+
+    # Split into S3 and local paths
+    s3_by_bucket: dict[str, list[str]] = {}
+
+    for f in files:
+        bucket, key = get_bucket_key(f)
+        if not key:  # pragma: no cover
+            # Skip bucket-only paths
+            continue
+        s3_by_bucket.setdefault(bucket, []).append(key)
+
+    def _s3_delete_chunk(bucket: str, keys_chunk: list[str]) -> None:
+        if not keys_chunk:  # pragma: no cover
+            return
+        # Quiet response to minimize payload; S3 ignores non-existent keys
+        s3_client.delete_objects(
+            Bucket=bucket,
+            Delete={
+                "Objects": [{"Key": k} for k in keys_chunk],
+                "Quiet": True,
+            },
+        )
+
+    # Execute S3 batch deletions and local deletions in parallel
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # Queue S3 batches
+        for bucket, keys in s3_by_bucket.items():
+            for i in range(0, len(keys), 1000):
+                executor.submit(_s3_delete_chunk, bucket, keys[i : i + 1000])
+
+
+def _delete_files_local(files: list[str], max_workers: int = 500) -> None:
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         executor.map(delete_file, files)
+
+
+def delete_files(files: list[str], max_workers: int = 500) -> None:
+    """Delete multiple files from S3 or local storage.
+
+    - For S3 paths, uses the `delete_objects` batch API (up to 1000 keys/request)
+      and groups deletions by bucket for efficiency.
+    - For local paths, deletes concurrently using up to `max_workers` threads.
+    """
+    s3_files = [f for f in files if f.startswith(S3_PREFIX)]
+    local_files = [f for f in files if not f.startswith(S3_PREFIX)]
+
+    if s3_files:
+        _delete_files_s3(s3_files, max_workers=max_workers)
+    if local_files:
+        _delete_files_local(local_files, max_workers=max_workers)
 
 
 def copy_file(src: str, dst: str, chunk_size: int = 131072) -> None:
