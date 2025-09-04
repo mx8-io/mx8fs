@@ -20,6 +20,7 @@ TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR TH
 
 import os
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -716,3 +717,41 @@ def test_get_bucket_key() -> None:
     assert get_bucket_key("s3://my-bucket/my-key") == ("my-bucket", "my-key")
     assert get_bucket_key("s3://my-bucket/") == ("my-bucket", "")
     assert get_bucket_key("s3://my-bucket") == ("my-bucket", "")
+
+
+@pytest.mark.parametrize("path", [f"s3://{TEST_BUCKET_NAME}/cutoff_test/", None])
+def test_get_files_and_purge_local_with_cutoff(path: str, tmp_path: Path) -> None:
+
+    root = path or str(tmp_path)
+
+    old_path = os.path.join(root, "old.txt")
+    new_path = os.path.join(root, "new.txt")
+
+    # Create the older object
+    write_file(old_path, "old")
+
+    # Ensure different LastModified timestamps
+    time.sleep(2)
+    cutoff = datetime.now(timezone.utc)
+    time.sleep(2)
+
+    # Create the newer object
+    write_file(new_path, "new")
+
+    files = sorted(get_files(root, cutoff_date=cutoff))
+    assert files == ["old.txt"]
+
+    # Dry run purge should list only the old file
+    listed = purge_folder(root, dry_run=True, cutoff_date=cutoff)
+    assert set(listed) == {old_path}
+    assert file_exists(old_path)
+    assert file_exists(new_path)
+
+    # Actual purge should delete only the old file
+    deleted = purge_folder(root, dry_run=False, cutoff_date=cutoff)
+    assert set(deleted) == {old_path}
+    assert not file_exists(old_path)
+    assert file_exists(new_path)
+
+    # Cleanup
+    delete_file(new_path)

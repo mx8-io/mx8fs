@@ -186,10 +186,57 @@ def delete_file(file: str) -> None:
             pass
 
 
-def delete_files(files: list[str], max_workers: int = 500) -> None:
-    """Delete multiple files from S3 or local storage, using up to max_workers threads."""
+def _delete_files_s3(files: list[str], max_workers: int = 500) -> None:
+
+    # Split into S3 and local paths
+    s3_by_bucket: dict[str, list[str]] = {}
+
+    for f in files:
+        bucket, key = get_bucket_key(f)
+        if not key:  # pragma: no cover
+            # Skip bucket-only paths
+            continue
+        s3_by_bucket.setdefault(bucket, []).append(key)
+
+    def _s3_delete_chunk(bucket: str, keys_chunk: list[str]) -> None:
+        if not keys_chunk:  # pragma: no cover
+            return
+        # Quiet response to minimize payload; S3 ignores non-existent keys
+        s3_client.delete_objects(
+            Bucket=bucket,
+            Delete={
+                "Objects": [{"Key": k} for k in keys_chunk],
+                "Quiet": True,
+            },
+        )
+
+    # Execute S3 batch deletions and local deletions in parallel
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # Queue S3 batches
+        for bucket, keys in s3_by_bucket.items():
+            for i in range(0, len(keys), 1000):
+                executor.submit(_s3_delete_chunk, bucket, keys[i : i + 1000])
+
+
+def _delete_files_local(files: list[str], max_workers: int = 500) -> None:
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         executor.map(delete_file, files)
+
+
+def delete_files(files: list[str], max_workers: int = 500) -> None:
+    """Delete multiple files from S3 or local storage.
+
+    - For S3 paths, uses the `delete_objects` batch API (up to 1000 keys/request)
+      and groups deletions by bucket for efficiency.
+    - For local paths, deletes concurrently using up to `max_workers` threads.
+    """
+    s3_files = [f for f in files if f.startswith(S3_PREFIX)]
+    local_files = [f for f in files if not f.startswith(S3_PREFIX)]
+
+    if s3_files:
+        _delete_files_s3(s3_files, max_workers=max_workers)
+    if local_files:
+        _delete_files_local(local_files, max_workers=max_workers)
 
 
 def copy_file(src: str, dst: str, chunk_size: int = 131072) -> None:
@@ -222,32 +269,65 @@ def move_file(src: str, dst: str) -> None:
     delete_file(src)
 
 
-def get_files(root_path: str, prefix: str = "") -> List[str]:
-    """Returns a list of files from S3 or local storage with the relevant prefix.
+def _get_files_s3(root_path: str, prefix: str = "", cutoff_utc: datetime | None = None) -> List[str]:
+    bucket, key = get_bucket_key(root_path)
+    key = key + "/" if not key.endswith("/") else key
 
-    The prefix significantly improves performance for S3 by reducing the number of objects listed.
-    """
-    if root_path.startswith(S3_PREFIX):
-        bucket, key = get_bucket_key(root_path)
-        key = key + "/" if not key.endswith("/") else key
+    paginator = s3_client.get_paginator("list_objects_v2")
 
-        paginator = s3_client.get_paginator("list_objects_v2")
-        files = []
+    # Normalize cutoff_date to timezone-aware UTC for comparison consistency
+    iterator = paginator.paginate(Bucket=bucket, Prefix=key + prefix, PaginationConfig={"PageSize": 10_000})
 
-        for page in paginator.paginate(Bucket=bucket, Prefix=key + prefix, PaginationConfig={"PageSize": 10_000}):
-            if "Contents" in page:
-                files.extend([obj["Key"].removeprefix(key) for obj in page["Contents"]])
+    if cutoff_utc:
+        search = "Contents[?to_string(LastModified)<'\"" + cutoff_utc.strftime("%Y-%m-%d %H:%M:%S%z") + "\"'].Key"
+    else:
+        search = "Contents[].Key"
+    return [file.removeprefix(key) for file in iterator.search(search) if file]
 
-        return files
 
+def _generate_local_files(root_path: str, prefix: str = "") -> Generator[str, None, None]:
     root_path = os.path.abspath(os.path.normpath(root_path)) + os.path.sep
-    results: List[str] = []
     for dirpath, _, filenames in os.walk(root_path):
         for name in filenames:
             rel = os.path.relpath(os.path.join(dirpath, name), root_path)
             if not prefix or rel.startswith(prefix):
-                results.append(rel)
-    return results
+                yield rel
+
+
+def _generate_local_files_cutoff(cutoff_utc: datetime, root_path: str, prefix: str = "") -> Generator[str, None, None]:
+    # Normalize cutoff_date to timezone-aware UTC for comparison consistency
+    for rel in _generate_local_files(root_path, prefix):
+        full_path = os.path.join(root_path, rel)
+        try:
+            mtime = datetime.fromtimestamp(os.path.getmtime(full_path), tz=timezone.utc)
+        except FileNotFoundError:  # pragma: no cover
+            # File may have been deleted during traversal; skip
+            continue
+        if mtime < cutoff_utc:
+            yield rel
+
+
+def get_files(root_path: str, prefix: str = "", cutoff_date: datetime | None = None) -> List[str]:
+    """Returns a list of files from S3 or local storage with the relevant prefix.
+
+    - If `cutoff_date` is provided, only returns files whose last modified time is strictly
+      earlier than `cutoff_date` ("older than" the specified date).
+    - The prefix significantly improves performance for S3 by reducing the number of objects listed.
+    """
+    # Normalize cutoff_date to timezone-aware UTC for comparison consistency
+    cutoff_utc: datetime | None
+    if cutoff_date is None:
+        cutoff_utc = None
+    else:
+        cutoff_utc = cutoff_date if cutoff_date.tzinfo else cutoff_date.replace(tzinfo=timezone.utc)
+        cutoff_utc = cutoff_utc.astimezone(timezone.utc)
+
+    if root_path.startswith(S3_PREFIX):
+        return _get_files_s3(root_path, prefix, cutoff_utc)
+
+    if cutoff_utc:
+        return list(_generate_local_files_cutoff(cutoff_utc, root_path, prefix))
+    return list(_generate_local_files(root_path, prefix))
 
 
 def _s3_get_folders(root_path: str, prefix: str = "") -> List[str]:
@@ -441,7 +521,12 @@ def GzipFileHandler(path: str, mode: str = "rb", encoding: str | None = None) ->
             yield gz_file
 
 
-def purge_folder(root_path: str, dry_run: bool = True, max_workers: int = 500) -> List[str]:
+def purge_folder(
+    root_path: str,
+    dry_run: bool = True,
+    max_workers: int = 500,
+    cutoff_date: datetime | None = None,
+) -> List[str]:
     """Delete all files within a folder/prefix on S3 or a local directory.
 
     For S3, root_path should be an S3 URL (s3://bucket/path/). Uses get_files to list objects
@@ -451,13 +536,16 @@ def purge_folder(root_path: str, dry_run: bool = True, max_workers: int = 500) -
     :param root_path: The S3 bucket/prefix or local directory to purge
     :param dry_run: If True, no files are deleted, and the function returns the list of files that would be deleted
     :param max_workers: The maximum number of worker threads to use for deletion
+    :param cutoff_date: If provided, only purge files older than this datetime
 
     Returns a sorted list of full paths of files deleted (or that would be deleted).
     """
     if root_path.startswith(S3_PREFIX):
-        full_paths = sorted(f"{root_path.rstrip('/')}/{f}" for f in get_files(root_path))
+        full_paths = sorted(f"{root_path.rstrip('/')}/{f}" for f in get_files(root_path, cutoff_date=cutoff_date))
     else:
-        full_paths = sorted(os.path.join(os.path.normpath(root_path), f) for f in get_files(root_path))
+        full_paths = sorted(
+            os.path.join(os.path.normpath(root_path), f) for f in get_files(root_path, cutoff_date=cutoff_date)
+        )
 
     if not dry_run:
         delete_files(full_paths, max_workers=max_workers)
@@ -465,6 +553,7 @@ def purge_folder(root_path: str, dry_run: bool = True, max_workers: int = 500) -
         if not root_path.startswith(S3_PREFIX):
             # Clean up any subdirectories
             for dirpath, _, _ in os.walk(root_path, topdown=False):
-                os.rmdir(dirpath)
+                if not os.listdir(dirpath):
+                    os.rmdir(dirpath)
 
     return full_paths
