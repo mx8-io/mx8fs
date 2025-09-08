@@ -271,7 +271,7 @@ def move_file(src: str, dst: str) -> None:
 
 def _get_files_s3(root_path: str, prefix: str = "", cutoff_utc: datetime | None = None) -> List[str]:
     bucket, key = get_bucket_key(root_path)
-    key = key + "/" if not key.endswith("/") else key
+    key = key + "/" if key and not key.endswith("/") else key
 
     paginator = s3_client.get_paginator("list_objects_v2")
 
