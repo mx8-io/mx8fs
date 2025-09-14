@@ -115,7 +115,7 @@ Below are the functions and classes exported by the library (`mx8fs.__all__`). P
   ```
 
 - `get_files(root_path: str, prefix: str = "", cutoff_date: datetime | None = None, cutoff_earlier: bool = True) -> list[str]`: List files under a root.
-  - S3: returns keys relative to the root prefix; optional `prefix` filter and `cutoff_date` (defautls to older than) on `LastModified`.
+  - S3: returns keys relative to the root prefix; optional `prefix` filter and `cutoff_date` (defaults to older than) on `LastModified`.
   - Local: returns relative file paths under the directory; supports the same filters (mtime in UTC).
 
   Example:
