@@ -324,7 +324,7 @@ def get_files(
     """Returns a list of files from S3 or local storage with the relevant prefix.
 
     - If `cutoff_date` is provided, only returns files whose last modified time is strictly
-      earlier or later than `cutoff_date` ("older than" the specified date).
+      earlier or later than `cutoff_date`.
     - If `cutoff_earlier` is True (default), returns files older than `cutoff_date`,
       otherwise returns files newer or equal to `cutoff_date`.
     - The prefix significantly improves performance for S3 by reducing the number of objects listed.

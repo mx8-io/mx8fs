@@ -114,8 +114,8 @@ Below are the functions and classes exported by the library (`mx8fs.__all__`). P
   move_file('s3://my-bucket/new.txt', 's3://my-bucket/archive/new.txt')
   ```
 
-- `get_files(root_path: str, prefix: str = "", cutoff_date: datetime | None = None) -> list[str]`: List files under a root.
-  - S3: returns keys relative to the root prefix; optional `prefix` filter and `cutoff_date` (strictly older than) on `LastModified`.
+- `get_files(root_path: str, prefix: str = "", cutoff_date: datetime | None = None, cutoff_earlier: bool = True) -> list[str]`: List files under a root.
+  - S3: returns keys relative to the root prefix; optional `prefix` filter and `cutoff_date` (defautls to older than) on `LastModified`.
   - Local: returns relative file paths under the directory; supports the same filters (mtime in UTC).
 
   Example:
