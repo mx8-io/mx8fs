@@ -269,7 +269,9 @@ def move_file(src: str, dst: str) -> None:
     delete_file(src)
 
 
-def _get_files_s3(root_path: str, prefix: str = "", cutoff_utc: datetime | None = None) -> List[str]:
+def _get_files_s3(
+    root_path: str, prefix: str = "", cutoff_utc: datetime | None = None, cutoff_earlier: bool = True
+) -> List[str]:
     bucket, key = get_bucket_key(root_path)
     key = key + "/" if key and not key.endswith("/") else key
 
@@ -279,7 +281,14 @@ def _get_files_s3(root_path: str, prefix: str = "", cutoff_utc: datetime | None 
     iterator = paginator.paginate(Bucket=bucket, Prefix=key + prefix, PaginationConfig={"PageSize": 10_000})
 
     if cutoff_utc:
-        search = "Contents[?to_string(LastModified)<'\"" + cutoff_utc.strftime("%Y-%m-%d %H:%M:%S%z") + "\"'].Key"
+        comparator = "<" if cutoff_earlier else ">="
+        search = (
+            "Contents[?to_string(LastModified)"
+            + comparator
+            + "'\""
+            + cutoff_utc.strftime("%Y-%m-%d %H:%M:%S%z")
+            + "\"'].Key"
+        )
     else:
         search = "Contents[].Key"
     return [file.removeprefix(key) for file in iterator.search(search) if file]
@@ -294,7 +303,9 @@ def _generate_local_files(root_path: str, prefix: str = "") -> Generator[str, No
                 yield rel
 
 
-def _generate_local_files_cutoff(cutoff_utc: datetime, root_path: str, prefix: str = "") -> Generator[str, None, None]:
+def _generate_local_files_cutoff(
+    cutoff_utc: datetime, root_path: str, prefix: str = "", cutoff_earlier: bool = True
+) -> Generator[str, None, None]:
     # Normalize cutoff_date to timezone-aware UTC for comparison consistency
     for rel in _generate_local_files(root_path, prefix):
         full_path = os.path.join(root_path, rel)
@@ -303,15 +314,19 @@ def _generate_local_files_cutoff(cutoff_utc: datetime, root_path: str, prefix: s
         except FileNotFoundError:  # pragma: no cover
             # File may have been deleted during traversal; skip
             continue
-        if mtime < cutoff_utc:
+        if (mtime < cutoff_utc) == cutoff_earlier:
             yield rel
 
 
-def get_files(root_path: str, prefix: str = "", cutoff_date: datetime | None = None) -> List[str]:
+def get_files(
+    root_path: str, prefix: str = "", cutoff_date: datetime | None = None, cutoff_earlier: bool = True
+) -> List[str]:
     """Returns a list of files from S3 or local storage with the relevant prefix.
 
     - If `cutoff_date` is provided, only returns files whose last modified time is strictly
-      earlier than `cutoff_date` ("older than" the specified date).
+      earlier or later than `cutoff_date`.
+    - If `cutoff_earlier` is True (default), returns files older than `cutoff_date`,
+      otherwise returns files newer or equal to `cutoff_date`.
     - The prefix significantly improves performance for S3 by reducing the number of objects listed.
     """
     # Normalize cutoff_date to timezone-aware UTC for comparison consistency
@@ -323,10 +338,10 @@ def get_files(root_path: str, prefix: str = "", cutoff_date: datetime | None = N
         cutoff_utc = cutoff_utc.astimezone(timezone.utc)
 
     if root_path.startswith(S3_PREFIX):
-        return _get_files_s3(root_path, prefix, cutoff_utc)
+        return _get_files_s3(root_path, prefix, cutoff_utc, cutoff_earlier)
 
     if cutoff_utc:
-        return list(_generate_local_files_cutoff(cutoff_utc, root_path, prefix))
+        return list(_generate_local_files_cutoff(cutoff_utc, root_path, prefix, cutoff_earlier))
     return list(_generate_local_files(root_path, prefix))
 
 
@@ -467,22 +482,28 @@ class BinaryFileHandler:
                 self.path, self.mode, encoding="UTF-8" if self.mode == "w" else None
             )
 
+    def _set_buffer_http(self) -> None:
+        with _get_response(self.path) as response:
+            self._buffer = BytesIO(response.read())
+        self._buffer.seek(0)
+
+    def _set_buffer_s3(self) -> None:
+        bucket, key = get_bucket_key(self.path)
+        if self.mode == "rb":
+            # Download the file from S3 to the stream
+            try:
+                s3_client.download_fileobj(Bucket=bucket, Key=key, Fileobj=self._buffer)
+            except s3_client.exceptions.ClientError as exc:
+                raise FileNotFoundError(f"File {self.path} not found") from exc
+            self._buffer.seek(0)
+
     def __enter__(self) -> BytesIO | IO:
         """Read from S3, HTTPS, or open the stream"""
         if self.is_https:
-            with _get_response(self.path) as response:
-                self._buffer = BytesIO(response.read())
-            self._buffer.seek(0)
+            self._set_buffer_http()
 
         if self.is_s3:
-            bucket, key = get_bucket_key(self.path)
-            if self.mode == "rb":
-                # Download the file from S3 to the stream
-                try:
-                    s3_client.download_fileobj(Bucket=bucket, Key=key, Fileobj=self._buffer)
-                except s3_client.exceptions.ClientError as exc:
-                    raise FileNotFoundError(f"File {self.path} not found") from exc
-                self._buffer.seek(0)
+            self._set_buffer_s3()
 
         return self._buffer
 
