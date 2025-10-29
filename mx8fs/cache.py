@@ -79,7 +79,7 @@ def _do_logging(
         try:
             logging.getLogger(log_group).log(
                 level,
-                message,
+                f"{message} - {filename}",
                 extra={
                     "cache_result": result,
                     "cache_args": args,
@@ -93,7 +93,7 @@ def _do_logging(
             # If we get a type error, case the dangerous types to strings
             logging.getLogger(log_group).log(
                 level,
-                message,
+                f"{message} - {filename}",
                 extra={
                     "cache_result": str(result),
                     "cache_args": args,
