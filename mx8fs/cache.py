@@ -59,12 +59,14 @@ def _get_clean_kwargs(kwargs: Dict, ignore_kwargs: Optional[List[str]]) -> Dict:
 
 def _do_logging(
     log_group: str,
+    message: str,
     result: Any,
     args: Tuple,
     kwargs: Dict,
     filename: str,
     func: Callable,
     expiration_seconds: int,
+    level: int,
 ) -> None:
     """Log cache hit"""
 
@@ -75,8 +77,9 @@ def _do_logging(
 
     if log_group:
         try:
-            logging.getLogger(log_group).debug(
-                "Cache hit",
+            logging.getLogger(log_group).log(
+                level,
+                message,
                 extra={
                     "cache_result": result,
                     "cache_args": args,
@@ -88,8 +91,9 @@ def _do_logging(
             )
         except TypeError:  # pragma: no cover
             # If we get a type error, case the dangerous types to strings
-            logging.getLogger(log_group).debug(
-                "Cache hit",
+            logging.getLogger(log_group).log(
+                level,
+                message,
                 extra={
                     "cache_result": str(result),
                     "cache_args": args,
@@ -106,6 +110,7 @@ def cache_to_disk_binary(
     expiration_seconds: int = 0,
     log_group: str = "",
     ignore_kwargs: Optional[List[str]] = None,
+    level: int = logging.DEBUG,
 ) -> Callable[..., Callable[..., Any]]:
     """Cache decorator for any MX8 functions.
 
@@ -118,6 +123,7 @@ def cache_to_disk_binary(
         expiration_seconds: The number of seconds before the cache expires
         log_group: The log group to log cache hits to
         ignore_kwargs: A list of kwargs to ignore when creating the cache key
+        level: The logging level to use, defaults to logging.DEBUG
     """
 
     def decorator(func: Callable) -> Callable[..., Any]:
@@ -138,10 +144,15 @@ def cache_to_disk_binary(
                 with BinaryFileHandler(filename) as file_handler:
                     result = pickle.load(file_handler)
 
-                _do_logging(log_group, result, args, clean_kwargs, filename, func, expiration_seconds)
+                _do_logging(
+                    log_group, "Cache hit", result, args, clean_kwargs, filename, func, expiration_seconds, level
+                )
 
             except FileNotFoundError:
-                # Cache miss, execute the function and save the result to disk
+                # Cache miss, execute the function  and save the result to disk
+                _do_logging(
+                    log_group, "Cache miss", None, args, clean_kwargs, filename, func, expiration_seconds, level
+                )
                 result = func(*args, **kwargs)
                 with BinaryFileHandler(filename, "wb") as file_handler:
                     pickle.dump(result, file_handler)
@@ -158,6 +169,7 @@ def cache_to_disk(
     expiration_seconds: int = 0,
     log_group: str = "",
     ignore_kwargs: Optional[List[str]] = None,
+    level: int = logging.DEBUG,
 ) -> Callable[..., Callable[..., str | Any]]:
     """Cache decorator for any MX8 functions.
 
@@ -170,6 +182,7 @@ def cache_to_disk(
         expiration_seconds: The number of seconds before the cache expires
         log_group: The log group to log cache hits to
         ignore_kwargs: A list of kwargs to ignore when creating the cache key
+        level: The logging level to use, defaults to logging.DEBUG
     """
 
     def decorator(func: Callable) -> Callable[..., str | Any]:
@@ -190,10 +203,15 @@ def cache_to_disk(
                 # Try to read the cached result from disk
                 result = read_file(filename)
 
-                _do_logging(log_group, result, args, clean_kwargs, filename, func, expiration_seconds)
+                _do_logging(
+                    log_group, "Cache hit", result, args, clean_kwargs, filename, func, expiration_seconds, level
+                )
 
             except FileNotFoundError:
                 # Cache miss, execute the function and save the result to disk
+                _do_logging(
+                    log_group, "Cache miss", None, args, clean_kwargs, filename, func, expiration_seconds, level
+                )
                 result = func(*args, **kwargs)
                 write_file(filename, result)
 
