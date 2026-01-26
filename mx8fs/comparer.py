@@ -1,5 +1,5 @@
 """
-Support functions for testing
+Support functions for testing.
 
 Copyright (c) 2023-2025 MX8 Inc, all rights reserved.
 
@@ -24,7 +24,7 @@ import re
 from difflib import ndiff
 from logging import getLogger
 from tempfile import NamedTemporaryFile
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 from mx8fs.file_io import read_file, write_file
 
@@ -32,48 +32,63 @@ logger = getLogger("mx8.comparer")
 
 
 def get_diff(a: str, b: str) -> str:
+    """Return line-by-line differences, excluding unchanged lines."""
     return "\n".join(d for d in ndiff(a.splitlines(), b.splitlines()) if not d.startswith(" "))
 
 
 class Differences:
+    """Store differences discovered during comparisons."""
+
     def __init__(self) -> None:
-        self._differences: List[Dict[str, str]] = []
+        """Initialize an empty differences collection."""
+        self._differences: list[dict[str, str]] = []
 
     def __repr__(self) -> str:
+        """Return a JSON-formatted representation of the differences."""
         return json.dumps(self._differences, indent=4)
 
     def __eq__(self, value: object) -> bool:
+        """Compare stored differences with another value."""
         return self._differences == value
 
     def __bool__(self) -> bool:
+        """Return True when differences are present."""
         return bool(self._differences)
 
     def __len__(self) -> int:
+        """Return the number of stored differences."""
         return len(self._differences)
 
     def contains(self, key: str) -> bool:
+        """Check whether any stored difference contains the key."""
         return any(key in v for d in self._differences for v in d.values())
 
-    def append(self, differences: Dict[str, str]) -> None:
+    def append(self, differences: dict[str, str]) -> None:
+        """Append a differences entry."""
         self._differences.append(differences)
 
     def clear(self) -> None:
+        """Remove all stored differences."""
         self._differences.clear()
 
     @property
-    def keys(self) -> List[str]:
+    def keys(self) -> list[str]:
+        """Return the top-level keys for each stored difference."""
         return [list(d.keys())[0] for d in self._differences]
 
 
 class ResultsComparer:
+    """Compare result files and dictionaries with optional obfuscation."""
+
     _DEFAULT_OBFUSCATE_REGEX = ".*(password|secret|token|key|auth|credentials|salt|signature|hash|webhook).*"
 
     def __init__(
         self,
-        ignore_keys: Optional[List[str]],
+        ignore_keys: list[str] | None,
         create_test_data: bool = False,
-        obfuscate_regex: Optional[str] = None,
+        obfuscate_regex: str | None = None,
     ) -> None:
+        """Initialize the comparer."""
         self._regex_obfuscation = re.compile(
             obfuscate_regex if obfuscate_regex is not None else self._DEFAULT_OBFUSCATE_REGEX, re.IGNORECASE
         )
@@ -109,15 +124,12 @@ class ResultsComparer:
         return "\n".join(obfuscate_line(line) for line in text.splitlines())
 
     def _log_differences(self, key: str, correct: str, test: str) -> None:
-        """Log the differences between two strings"""
+        """Log the differences between two strings."""
         if correct != test:
             self._differences.append({key: get_diff(correct, test)})
 
     def _compare_dicts(self, correct: Any, test: Any, recursive: bool = False, root_key: str = "root") -> None:
-        """
-        Compare two dictionaries recursively, ignoring elements with the given key
-        """
-
+        """Compare two dictionaries recursively, ignoring elements with the given key."""
         if not recursive:
             logger.debug(
                 {
@@ -157,13 +169,13 @@ class ResultsComparer:
                     self._compare_dicts(correct[key], test[key], recursive=True, root_key=f"{root_key}/{key}")
 
     def compare_dicts(self, correct: Any, test: Any) -> Differences:
-        """Compare two dictionaries"""
+        """Compare two dictionaries."""
         self._differences.clear()
         self._compare_dicts(correct, test)
         return self._differences
 
     def get_text_differences(self, test: str, correct: str) -> Differences:
-        """Compare a test file with a correct file"""
+        """Compare a test file with a correct file."""
         differences = Differences()
 
         # Obfuscate the test file content before diffing
@@ -183,8 +195,7 @@ class ResultsComparer:
         return differences
 
     def get_dict_differences(self, test: str, correct: str) -> Differences:
-        """Compare a test file with a correct file"""
-
+        """Compare a test file with a correct file."""
         # Load and obfuscate the test file
         test_dict = json.loads(read_file(test))
         obfuscated_test_dict = self._obfuscate_dict(test_dict)
@@ -211,8 +222,7 @@ class ResultsComparer:
         response: Any,
         correct_file: str,
     ) -> Differences:
-        """Check the response from the reporting API and return the differences"""
-
+        """Check the response from the reporting API and return the differences."""
         file_name = os.path.basename(correct_file)
 
         # Write the response to a temporary file

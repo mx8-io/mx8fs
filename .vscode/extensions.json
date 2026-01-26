@@ -12,7 +12,6 @@
     "kevinrose.vsc-python-indent",
     "humao.rest-client",
     "buenon.scratchpads",
-    "sonarsource.sonarlint-vscode",
     "mikoz.autoflake-extension",
     "boto3typed.boto3-ide",
     "tamasfe.even-better-toml",

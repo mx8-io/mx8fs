@@ -8,7 +8,7 @@ license = "MIT"
 packages =  [{ include = "mx8fs" }]
 
 [tool.poetry.dependencies]
-python = ">=3.10"
+python = ">=3.12"
 boto3 = ">=1.26.137"
 
 [tool.poetry.group.dev.dependencies]
@@ -28,7 +28,7 @@ flake8 = ">=7.1.1"
 autoflake = ">=2.3.1"
 
 [tool.mypy]
-python_version = "3.10"
+python_version = "3.12"
 check_untyped_defs = true
 ignore_missing_imports = true
 disallow_untyped_defs = true
@@ -57,16 +57,30 @@ filterwarnings = "error:::mx8fs"
 
 [tool.black]
 line-length = 120
-target-version = ['py310']
+target-version = ['py312']
 include = '\.pyi?$'
 force-exclude = "test_data|.venv"
 
 [tool.ruff]
-select = ["I", "E", "F", "W", "B", "C"]
-ignore = []
 line-length = 120
-target-version = "py310"
+target-version = "py312"
+exclude = ["tests/test_data", "typings"]
 
+
+[tool.ruff.lint]
+select = [
+    "I",
+    "E",
+    "F",
+    "W",
+    "B",
+    "C",
+    "UP",
+    "D",
+    "N",
+]
+extend-ignore = ["D203", "D212"]
+per-file-ignores = { "tests/**" = ["D"], "api/**" = ["D", "B008"], "cdk/**" = ["D"], "**/__init__.py" = ["D"] }
 
 [build-system]
 requires = ["poetry-core>=1.0.0"]

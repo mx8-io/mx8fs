@@ -20,7 +20,7 @@ TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR TH
 # pylint: disable=protected-access
 
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 import pytest
 from pydantic import BaseModel
@@ -32,7 +32,7 @@ class StorageTestClass(BaseModel):
     """Mock model for testing."""
 
     value: str
-    key: Optional[str] = None
+    key: str | None = None
 
 
 @pytest.fixture(name="file_storage")
@@ -98,16 +98,17 @@ def test_get_path(file_storage: JsonFileStorage) -> None:
 def test_get_unique_key(file_storage: JsonFileStorage) -> None:
     """Test creation of unique survey_key"""
     previous_ids = []
-    i = 0
+    last_index = -1
 
     try:
         for i in range(40):
+            last_index = i
             unique_key = file_storage._get_unique_key(key_length=1)
             file_storage.write(StorageTestClass(value="content1"), unique_key)
             assert unique_key not in previous_ids
             previous_ids.append(unique_key)
     except RecursionError:
-        assert i == 36
+        assert last_index == 36
 
     assert len(previous_ids) == 36
 

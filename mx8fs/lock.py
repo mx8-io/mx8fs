@@ -41,7 +41,7 @@ from datetime import datetime, timedelta
 from functools import cached_property
 from random import choice
 from time import sleep, time
-from typing import Any, Dict, List
+from typing import Any
 
 from mx8fs import delete_file, list_files, write_file
 
@@ -52,8 +52,7 @@ TIME_FORMAT = "%Y%m%d%H%M%S"
 
 class Waiter:
     """
-
-    A generic wait and timeout class.
+    Provide generic wait and timeout behavior.
 
     Raises TimeoutError() if the task doesn't occur in the period.
 
@@ -68,43 +67,41 @@ class Waiter:
 
     def __init__(self, wait_period: float, time_out_seconds: float):
         """
-        :param wait_period: the period to wait for between iterations
-        :param time_out_seconds: the time after which a TimeoutError is raised
+        Initialize the waiter.
+
+        Args:
+            wait_period: The period to wait for between iterations.
+            time_out_seconds: The time after which a TimeoutError is raised.
+
         """
         self.time_out_seconds = time_out_seconds
         self.wait_period = wait_period
         self._timeout: float | None = None
 
     def __enter__(self) -> "Waiter":
-        """
-        Starts the timer
-        """
+        """Start the timer."""
         self.start_timeout()
         return self
 
     def __exit__(self, *_: Any) -> None:
-        """
-        Stops the timer
-        """
+        """Stop the timer."""
         self._timeout = None
 
     def wait(self, number_times: int = 1) -> None:
-        """
-        Waits for the defined period
-        """
+        """Wait for the defined period."""
         sleep(self.wait_period * number_times)
 
     def start_timeout(self) -> None:
-        """
-        Starts a time out
-        """
+        """Start a timeout."""
         self._timeout = time() + self.time_out_seconds
 
     def timed_out(self) -> bool:
         """
-        Checks for a time out
+        Check whether the timer has timed out.
 
-        :return: true if the timer has timed out, otherwise false
+        Returns:
+            True if the timer has timed out; otherwise False.
+
         """
         if self._timeout is not None:
             return time() > self._timeout
@@ -112,9 +109,7 @@ class Waiter:
             raise ValueError("Someone has tried to call timed_out() before calling start_timeout()")
 
     def check_timeout(self) -> None:
-        """
-        Waits, and raises an exception if the timer has timed out
-        """
+        """Wait and raise an exception if the timer has timed out."""
         self.wait()
         if self.timed_out():
             raise TimeoutError("Timed out waiting for completion")
@@ -156,12 +151,14 @@ class FileLock:
         maximum_age: int = 900,  # 15 minutes, the maximum time a lambda can run
     ):
         """
-        Initializes the lock
+        Initialize the lock.
 
-        :param file: the file to lock
-        :param wait_period: the period to wait before confirming file lock
-        :param time_out_seconds: the time out to stop waiting after
-        :param maximum_age: the maximum age of lock files to respect
+        Args:
+            file: The file to lock.
+            wait_period: The period to wait before confirming file lock.
+            time_out_seconds: The time out to stop waiting after.
+            maximum_age: The maximum age of lock files to respect.
+
         """
         self.file = file
         self.waiter = Waiter(wait_period, time_out_seconds)
@@ -171,13 +168,12 @@ class FileLock:
     def _lock_file(self) -> str:
         """Get the lock file name."""
         timestamp = datetime.now().strftime(TIME_FORMAT)
-        random_key = "".join(choice(string.ascii_lowercase) for _ in range(12))  # NOSONAR
+        random_key = "".join(choice(string.ascii_lowercase) for _ in range(12))  # nosec - insecure random number
 
         return f"{self.file}.{timestamp}.{random_key}.lock"
 
     def __enter__(self) -> "FileLock":
         """Acquire the lock on the file. This will wait until the lock is available."""
-
         logger.debug("Getting lock on %s", self.file)
 
         # If the file is locked then wait for it to be unlocked
@@ -202,12 +198,12 @@ class FileLock:
         logger.debug("Acquired lock on %s", self.file)
         return self
 
-    def __exit__(self, *_: List[Any], **__: Dict[str, Any]) -> None:
+    def __exit__(self, *_: list[Any], **__: dict[str, Any]) -> None:
         """Release the lock on the file."""
         delete_file(self._lock_file)
         logger.debug("Released lock on %s", self.file)
 
-    def _get_lock_files(self) -> List[str]:
+    def _get_lock_files(self) -> list[str]:
         """Get all the lock files for the current file."""
         path = "/".join(self.file.split("/")[:-1])
         prefix = self.file.split("/")[-1]
@@ -220,7 +216,6 @@ class FileLock:
 
     def _lock_is_current(self, lock_file: str) -> bool:
         """Check if the lock file is current."""
-
         # If the lock file is not for the current file then it is not current
         if self.file not in lock_file:
             return False
