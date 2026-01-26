@@ -168,7 +168,7 @@ class FileLock:
     def _lock_file(self) -> str:
         """Get the lock file name."""
         timestamp = datetime.now().strftime(TIME_FORMAT)
-        random_key = "".join(choice(string.ascii_lowercase) for _ in range(12))
+        random_key = "".join(choice(string.ascii_lowercase) for _ in range(12))  # nosec - insecure random number
 
         return f"{self.file}.{timestamp}.{random_key}.lock"
 

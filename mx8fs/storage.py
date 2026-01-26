@@ -60,7 +60,9 @@ class JsonFileStorage:
         self.randomizer()
 
         # Generate a random key
-        key: str = "".join(random.choices(string.ascii_uppercase + string.digits, k=key_length))
+        key: str = "".join(
+            random.choices(string.ascii_uppercase + string.digits, k=key_length)  # nosec - insecure random number
+        )
 
         # If the key already exists, try again
         if file_exists(self._get_path(key)):
