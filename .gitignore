@@ -3,3 +3,7 @@ coverage/lcov.info
 .DS_Store
 __pycache__
 dist/
+
+
+#Ignore vscode AI rules
+.github/instructions/codacy.instructions.md

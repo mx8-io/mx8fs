@@ -21,16 +21,16 @@ import hashlib
 import json
 import logging
 import pickle
+from collections.abc import Callable
 from json.decoder import JSONDecodeError
 from time import time
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any
 
 from .file_io import BinaryFileHandler, read_file, write_file
 
 
-def get_cache_filename(path: str, name: str, extension: str, expiration_seconds: int = 0, **kwargs: Dict) -> str:
+def get_cache_filename(path: str, name: str, extension: str, expiration_seconds: int = 0, **kwargs: dict) -> str:
     """Create an optionally time expiring cache filename using hashed parameters."""
-
     # Create hashes based on the name and parameter hashes
     args = kwargs.pop("extra_args", ())
     param_hash = hashlib.sha256(pickle.dumps((args, kwargs))).hexdigest()
@@ -47,9 +47,8 @@ def get_cache_filename(path: str, name: str, extension: str, expiration_seconds:
     return f"{path}/{name}_{param_hash}{time_hash}.cache.{extension}"
 
 
-def _get_clean_kwargs(kwargs: Dict, ignore_kwargs: Optional[List[str]]) -> Dict:
-    """Remove ignored kwargs from the kwargs dict"""
-
+def _get_clean_kwargs(kwargs: dict, ignore_kwargs: list[str] | None) -> dict:
+    """Remove ignored kwargs from the kwargs dict."""
     clean_kwargs = kwargs.copy()
     for ignore in ignore_kwargs or []:
         clean_kwargs.pop(ignore, None)
@@ -61,15 +60,14 @@ def _do_logging(
     log_group: str,
     message: str,
     result: Any,
-    args: Tuple,
-    kwargs: Dict,
+    args: tuple,
+    kwargs: dict,
     filename: str,
     func: Callable,
     expiration_seconds: int,
     level: int,
 ) -> None:
-    """Log cache hit"""
-
+    """Log cache hit."""
     try:
         result = json.loads(result)
     except (JSONDecodeError, TypeError):
@@ -109,25 +107,30 @@ def cache_to_disk_binary(
     path: str,
     expiration_seconds: int = 0,
     log_group: str = "",
-    ignore_kwargs: Optional[List[str]] = None,
+    ignore_kwargs: list[str] | None = None,
     level: int = logging.DEBUG,
 ) -> Callable[..., Callable[..., Any]]:
-    """Cache decorator for any MX8 functions.
+    """
+    Cache MX8 function results to disk as pickle files.
 
-    This decorator will cache the result of the function to disk, and return
-    the cached result on subsequent calls. This is useful for caching the
-    results of expensive operations, such as calling an AI API
+    This decorator caches the result of the function to disk and returns the
+    cached result on subsequent calls. This is useful for caching expensive
+    operations such as calling an AI API.
 
-    Parameters:
-        path: The path to the cache directory
-        expiration_seconds: The number of seconds before the cache expires
-        log_group: The log group to log cache hits to
-        ignore_kwargs: A list of kwargs to ignore when creating the cache key
-        level: The logging level to use, defaults to logging.DEBUG
+    Args:
+        path: The path to the cache directory.
+        expiration_seconds: The number of seconds before the cache expires.
+        log_group: The log group to log cache hits to.
+        ignore_kwargs: Kwargs to ignore when creating the cache key.
+        level: The logging level to use, defaults to logging.DEBUG.
+
+    Returns:
+        A decorator that caches function results on disk.
+
     """
 
     def decorator(func: Callable) -> Callable[..., Any]:
-        def wrapper(*args: Tuple, **kwargs: Dict) -> Any:
+        def wrapper(*args: tuple, **kwargs: dict) -> Any:
             clean_kwargs = _get_clean_kwargs(kwargs, ignore_kwargs)
 
             filename = get_cache_filename(
@@ -168,25 +171,30 @@ def cache_to_disk(
     path: str,
     expiration_seconds: int = 0,
     log_group: str = "",
-    ignore_kwargs: Optional[List[str]] = None,
+    ignore_kwargs: list[str] | None = None,
     level: int = logging.DEBUG,
 ) -> Callable[..., Callable[..., str | Any]]:
-    """Cache decorator for any MX8 functions.
+    """
+    Cache MX8 function results to disk as text files.
 
-    This decorator will cache the result of the function to disk, and return
-    the cached result on subsequent calls. This is useful for caching the
-    results of expensive operations, such as calling an AI API
+    This decorator caches the result of the function to disk and returns the
+    cached result on subsequent calls. This is useful for caching expensive
+    operations such as calling an AI API.
 
-    Parameters:
-        path: The path to the cache directory
-        expiration_seconds: The number of seconds before the cache expires
-        log_group: The log group to log cache hits to
-        ignore_kwargs: A list of kwargs to ignore when creating the cache key
-        level: The logging level to use, defaults to logging.DEBUG
+    Args:
+        path: The path to the cache directory.
+        expiration_seconds: The number of seconds before the cache expires.
+        log_group: The log group to log cache hits to.
+        ignore_kwargs: Kwargs to ignore when creating the cache key.
+        level: The logging level to use, defaults to logging.DEBUG.
+
+    Returns:
+        A decorator that caches function results on disk.
+
     """
 
     def decorator(func: Callable) -> Callable[..., str | Any]:
-        def wrapper(*args: Tuple, **kwargs: Dict) -> str | Any:
+        def wrapper(*args: tuple, **kwargs: dict) -> str | Any:
 
             clean_kwargs = _get_clean_kwargs(kwargs, ignore_kwargs)
 

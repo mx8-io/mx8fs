@@ -1,5 +1,5 @@
 """
-AWS file IO functions
+AWS file IO functions.
 
 Copyright (c) 2023-2025 MX8 Inc, all rights reserved.
 
@@ -21,12 +21,13 @@ import gzip
 import os
 import urllib.error
 import urllib.request
+from collections.abc import Generator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from glob import glob
 from io import BytesIO
-from typing import IO, Any, Dict, Generator, List, Literal, Tuple, cast
+from typing import IO, Any, Literal, cast
 
 import boto3
 from botocore.config import Config
@@ -51,11 +52,11 @@ S3_PREFIX = "s3://"
 
 
 class VersionMismatchError(FileNotFoundError):
-    """Custom error for version mismatch when writing files"""
+    """Custom error for version mismatch when writing files."""
 
 
-def get_bucket_key(path: str) -> Tuple[str, str]:
-    """Get the bucket and key from a S3 path"""
+def get_bucket_key(path: str) -> tuple[str, str]:
+    """Get the bucket and key from a S3 path."""
     path = path.replace(S3_PREFIX, "")
     if "/" in path:
         bucket, key = path.split("/", 1)
@@ -64,7 +65,7 @@ def get_bucket_key(path: str) -> Tuple[str, str]:
 
 
 def file_exists(file: str) -> bool:
-    """Check if a file exists on S3 or local storage"""
+    """Check if a file exists on S3 or local storage."""
     if file.startswith(S3_PREFIX):
         bucket, key = get_bucket_key(file)
         try:
@@ -78,7 +79,7 @@ def file_exists(file: str) -> bool:
 
 @contextmanager
 def _get_response(url: str) -> Generator[HTTPResponse, None, None]:
-    """Read a file from HTTPS with UTF-8 encoding"""
+    """Read a file from HTTPS with UTF-8 encoding."""
     try:
         with urllib.request.urlopen(url) as resp:
             if resp.status != 200:  # pragma: no cover
@@ -89,7 +90,7 @@ def _get_response(url: str) -> Generator[HTTPResponse, None, None]:
 
 
 def read_file(file: str) -> str:
-    """Read a file from S3, HTTPS, or local storage with UTF-8 encoding"""
+    """Read a file from S3, HTTPS, or local storage with UTF-8 encoding."""
     if file.startswith(S3_PREFIX):
         bucket, key = get_bucket_key(file)
         try:
@@ -100,12 +101,13 @@ def read_file(file: str) -> str:
         with _get_response(file) as response:
             return str(response.read().decode("utf-8"))
     else:
-        with open(file, mode="r", encoding="UTF-8") as file_io:
+        with open(file, encoding="UTF-8") as file_io:
             return file_io.read()
 
 
-def read_file_with_version(file: str) -> Tuple[str, str]:
-    """Read a file from S3 or local storage with UTF-8 encoding and a version identifier
+def read_file_with_version(file: str) -> tuple[str, str]:
+    """
+    Read a file from S3 or local storage with UTF-8 encoding and a version identifier.
 
     For S3, the version identifier is the ETag of the file.
     For local storage, the version identifier is the last modified time of the file.
@@ -121,13 +123,13 @@ def read_file_with_version(file: str) -> Tuple[str, str]:
         except s3_client.exceptions.NoSuchKey as exc:
             raise FileNotFoundError(f"File {file} not found") from exc
     else:
-        with open(file, mode="r", encoding="UTF-8") as file_io:
+        with open(file, encoding="UTF-8") as file_io:
             # Use the file's last modified time as a unique hash
             return file_io.read(), str(os.path.getmtime(file))
 
 
 def write_file(file: str, data: str) -> None:
-    """Write a file to S3 or local storage with UTF-8 encoding"""
+    """Write a file to S3 or local storage with UTF-8 encoding."""
     if file.startswith(S3_PREFIX):
         bucket, key = get_bucket_key(file)
         s3_client.put_object(Bucket=bucket, Key=key, Body=data.encode("UTF-8"))
@@ -138,7 +140,8 @@ def write_file(file: str, data: str) -> None:
 
 
 def update_file_if_version_matches(file: str, data: str, version: str) -> None:
-    """Write a file to S3 or local storage with UTF-8 encoding if the version matches.
+    """
+    Write a file to S3 or local storage with UTF-8 encoding if the version matches.
 
     For S3, the version identifier is the ETag of the file.
     For local storage, the version identifier is the last modified time of the file.
@@ -174,7 +177,7 @@ def update_file_if_version_matches(file: str, data: str, version: str) -> None:
 
 
 def delete_file(file: str) -> None:
-    """Delete a file from S3 or local storage"""
+    """Delete a file from S3 or local storage."""
     if file.startswith(S3_PREFIX):
         bucket, key = get_bucket_key(file)
         s3_client.delete_object(Bucket=bucket, Key=key)
@@ -224,7 +227,8 @@ def _delete_files_local(files: list[str], max_workers: int = 500) -> None:
 
 
 def delete_files(files: list[str], max_workers: int = 500) -> None:
-    """Delete multiple files from S3 or local storage.
+    """
+    Delete multiple files from S3 or local storage.
 
     - For S3 paths, uses the `delete_objects` batch API (up to 1000 keys/request)
       and groups deletions by bucket for efficiency.
@@ -240,7 +244,7 @@ def delete_files(files: list[str], max_workers: int = 500) -> None:
 
 
 def copy_file(src: str, dst: str, chunk_size: int = 131072) -> None:
-    """Copy a file from S3 or local storage"""
+    """Copy a file from S3 or local storage."""
     if src.startswith(S3_PREFIX) and dst.startswith(S3_PREFIX):
         src_bucket, src_key = get_bucket_key(src)
         dst_bucket, dst_key = get_bucket_key(dst)
@@ -264,14 +268,14 @@ def copy_file(src: str, dst: str, chunk_size: int = 131072) -> None:
 
 
 def move_file(src: str, dst: str) -> None:
-    """Move a file from S3 or local storage"""
+    """Move a file from S3 or local storage."""
     copy_file(src, dst)
     delete_file(src)
 
 
 def _get_files_s3(
     root_path: str, prefix: str = "", cutoff_utc: datetime | None = None, cutoff_earlier: bool = True
-) -> List[str]:
+) -> list[str]:
     bucket, key = get_bucket_key(root_path)
     key = key + "/" if key and not key.endswith("/") else key
 
@@ -310,7 +314,7 @@ def _generate_local_files_cutoff(
     for rel in _generate_local_files(root_path, prefix):
         full_path = os.path.join(root_path, rel)
         try:
-            mtime = datetime.fromtimestamp(os.path.getmtime(full_path), tz=timezone.utc)
+            mtime = datetime.fromtimestamp(os.path.getmtime(full_path), tz=UTC)
         except FileNotFoundError:  # pragma: no cover
             # File may have been deleted during traversal; skip
             continue
@@ -320,8 +324,9 @@ def _generate_local_files_cutoff(
 
 def get_files(
     root_path: str, prefix: str = "", cutoff_date: datetime | None = None, cutoff_earlier: bool = True
-) -> List[str]:
-    """Returns a list of files from S3 or local storage with the relevant prefix.
+) -> list[str]:
+    """
+    Return a list of files from S3 or local storage with the relevant prefix.
 
     - If `cutoff_date` is provided, only returns files whose last modified time is strictly
       earlier or later than `cutoff_date`.
@@ -334,8 +339,8 @@ def get_files(
     if cutoff_date is None:
         cutoff_utc = None
     else:
-        cutoff_utc = cutoff_date if cutoff_date.tzinfo else cutoff_date.replace(tzinfo=timezone.utc)
-        cutoff_utc = cutoff_utc.astimezone(timezone.utc)
+        cutoff_utc = cutoff_date if cutoff_date.tzinfo else cutoff_date.replace(tzinfo=UTC)
+        cutoff_utc = cutoff_utc.astimezone(UTC)
 
     if root_path.startswith(S3_PREFIX):
         return _get_files_s3(root_path, prefix, cutoff_utc, cutoff_earlier)
@@ -345,13 +350,13 @@ def get_files(
     return list(_generate_local_files(root_path, prefix))
 
 
-def _s3_get_folders(root_path: str, prefix: str = "") -> List[str]:
+def _s3_get_folders(root_path: str, prefix: str = "") -> list[str]:
     bucket, key = get_bucket_key(root_path)
     # Ensure the key ends with a trailing slash for prefixing
     key = key + "/" if key and not key.endswith("/") else key
 
     paginator = s3_client.get_paginator("list_objects_v2")
-    folders: List[str] = []
+    folders: list[str] = []
 
     # Use Delimiter='/' to obtain top-level "folders" (CommonPrefixes)
     for page in paginator.paginate(
@@ -366,13 +371,13 @@ def _s3_get_folders(root_path: str, prefix: str = "") -> List[str]:
     return folders
 
 
-def _local_get_folders(root_path: str, prefix: str = "") -> List[str]:
+def _local_get_folders(root_path: str, prefix: str = "") -> list[str]:
     # Local filesystem: list immediate directories in root_path (non-recursive)
     root_path = os.path.abspath(root_path)
     if not os.path.isdir(root_path):
         return []
 
-    results: List[str] = []
+    results: list[str] = []
     try:
         for entry in os.listdir(root_path):
             if prefix and not entry.startswith(prefix):
@@ -386,8 +391,9 @@ def _local_get_folders(root_path: str, prefix: str = "") -> List[str]:
     return results
 
 
-def get_folders(root_path: str, prefix: str = "") -> List[str]:
-    """Returns a list of immediate subfolders from S3 or local storage with an optional prefix filter.
+def get_folders(root_path: str, prefix: str = "") -> list[str]:
+    """
+    Return a list of immediate subfolders from S3 or local storage with an optional prefix filter.
 
     Non-recursive: only immediate children are returned (no nested folder paths).
     """
@@ -396,8 +402,9 @@ def get_folders(root_path: str, prefix: str = "") -> List[str]:
     return _local_get_folders(root_path, prefix)
 
 
-def list_files(root_path: str, file_type: str, prefix: str = "") -> List[str]:
-    """Returns a list of files from S3 or local storage with the relevant suffix and optional prefix.
+def list_files(root_path: str, file_type: str, prefix: str = "") -> list[str]:
+    """
+    Return a list of files from S3 or local storage with the relevant suffix and optional prefix.
 
     The prefix significantly improves performance for S3 by reducing the number of objects listed.
     """
@@ -407,13 +414,12 @@ def list_files(root_path: str, file_type: str, prefix: str = "") -> List[str]:
 
 
 def most_recent_timestamp(root_path: str, file_type: str) -> float:
-    """Returns the most recent timestamp from S3 or local storage with the suffix"""
-
+    """Return the most recent timestamp from S3 or local storage with the suffix."""
     if root_path.startswith(S3_PREFIX):
-        default = datetime(1970, 1, 1, tzinfo=timezone.utc)
+        default = datetime(1970, 1, 1, tzinfo=UTC)
 
         def _get_timestamps() -> Generator[datetime, Any, None]:
-            """Get the max timestamp on each page in the paginator"""
+            """Get the max timestamp on each page in the paginator."""
             paginator = s3_client.get_paginator("list_objects_v2")
             bucket, key = get_bucket_key(root_path)
             for page in paginator.paginate(Bucket=bucket, Prefix=key, Delimiter="/"):
@@ -432,8 +438,7 @@ def most_recent_timestamp(root_path: str, file_type: str) -> float:
 
 
 def get_public_url(file: str, expires_in: int = 3600, method: str = "get_object") -> str:
-    """Get a signed URL for a file on S3"""
-
+    """Get a signed URL for a file on S3."""
     if file.startswith(S3_PREFIX):
         bucket, key = get_bucket_key(file)
         presigned_url = s3_client.generate_presigned_url(
@@ -448,19 +453,18 @@ def get_public_url(file: str, expires_in: int = 3600, method: str = "get_object"
 
 
 class BinaryFileHandler:
-    """File handler for S3, local storage, or HTTPS (read-only)"""
+    """File handler for S3, local storage, or HTTPS (read-only)."""
 
     _buffer: IO[Any]
 
     def __init__(self, path: str, mode: str = "rb", content_type: str | None = None):
         """
-        Creates the class, emulating the file object.
+        Create the class, emulating the file object.
 
         For S3, returns a BytesIO object for writing, and downloads the file
         For local storage, returns a file object
         For HTTPS, supports read-only ("rb") mode and fetches the file via HTTP(S)
         """
-
         if mode not in ["rb", "wb"]:
             raise NotImplementedError(f"mode {mode} is not supported")
 
@@ -498,7 +502,7 @@ class BinaryFileHandler:
             self._buffer.seek(0)
 
     def __enter__(self) -> BytesIO | IO:
-        """Read from S3, HTTPS, or open the stream"""
+        """Read from S3, HTTPS, or open the stream."""
         if self.is_https:
             self._set_buffer_http()
 
@@ -507,8 +511,8 @@ class BinaryFileHandler:
 
         return self._buffer
 
-    def __exit__(self, *_: List[Any], **__: Dict[str, Any]) -> None:
-        """Write to S3 or local storage and close the stream"""
+    def __exit__(self, *_: list[Any], **__: dict[str, Any]) -> None:
+        """Write to S3 or local storage and close the stream."""
         if self.is_s3 and self.mode == "wb":
             self._buffer.seek(0)
             bucket, key = get_bucket_key(self.path)
@@ -525,14 +529,18 @@ class BinaryFileHandler:
 
 
 @contextmanager
-def GzipFileHandler(path: str, mode: str = "rb", encoding: str | None = None) -> Generator[Any, Any, None]:  # NOSONAR
+def GzipFileHandler(  # noqa: N802
+    path: str, mode: str = "rb", encoding: str | None = None
+) -> Generator[Any, Any, None]:
     """
+    Open gzip-compressed files from S3 or local storage.
+
     Context manager for reading/writing gzip-compressed files from S3 or local storage,
     using BinaryFileHandler for the underlying file I/O.
     Supports binary ('rb', 'wb') and text ('rt', 'wt') modes.
     Usage:
         with GzipFileHandler(path, mode, encoding='utf-8') as f:
-            f.read() / f.write(...)
+            f.read() / f.write(...).
     """
     if mode not in ("rb", "wb", "rt", "wt"):
         raise NotImplementedError(f"mode {mode} is not supported")
@@ -547,8 +555,9 @@ def purge_folder(
     dry_run: bool = True,
     max_workers: int = 500,
     cutoff_date: datetime | None = None,
-) -> List[str]:
-    """Delete all files within a folder/prefix on S3 or a local directory.
+) -> list[str]:
+    """
+    Delete all files within a folder/prefix on S3 or a local directory.
 
     For S3, root_path should be an S3 URL (s3://bucket/path/). Uses get_files to list objects
     under the prefix. For local paths, the function walks the directory tree recursively.

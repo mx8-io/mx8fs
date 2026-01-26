@@ -77,7 +77,7 @@ class TestWaiter:
 
 def check_lock(file: str) -> bool:
     """Check the lock."""
-    test_str = str(random())  # NOSONAR
+    test_str = str(random())
     with FileLock(file, wait_period=0.1, time_out_seconds=20, maximum_age=30):
         write_file(file, test_str)
 
@@ -93,34 +93,34 @@ class TestFileLock:
 
     def test_lock_timeout(self, tmpdir: Path) -> None:
         """Test the lock timeout."""
-        file = os.path.join(tmpdir, f"test_lock_timeout.{random()}tmp")  # NOSONAR
+        file = os.path.join(tmpdir, f"test_lock_timeout.{random()}tmp")
         with FileLock(file, wait_period=1, time_out_seconds=5, maximum_age=20):
             sleep(0.1)
             with pytest.raises(TimeoutError):
                 with FileLock(file, wait_period=1, time_out_seconds=2, maximum_age=20):
-                    assert False, "File lock should have timed out"
+                    raise AssertionError("File lock should have timed out")
 
     def test_basic(self, tmpdir: Path) -> None:
         """ "Test the basic functionality of the lock."""
-        file = os.path.join(tmpdir, f"test_basic.{random()}.tmp")  # NOSONAR
+        file = os.path.join(tmpdir, f"test_basic.{random()}.tmp")
         check_lock(file)
         check_lock(file)
 
     def test_lock_ages(self, tmpdir: Path) -> None:
         """Test the lock over a longer time."""
-        file = os.path.join(tmpdir, f"test_lock_ages.{random()}.tmp")  # NOSONAR
+        file = os.path.join(tmpdir, f"test_lock_ages.{random()}.tmp")
 
         with FileLock(file, wait_period=1, time_out_seconds=2, maximum_age=10):
 
             with pytest.raises(TimeoutError):
                 with FileLock(file, wait_period=1, time_out_seconds=2, maximum_age=10):
-                    assert False, "File lock should have timed out"
+                    raise AssertionError("File lock should have timed out")
 
     def test_lock_multiprocess(self, tmpdir: Path) -> None:
         """Test the lock in a multiprocess environment."""
-        file = os.path.join(tmpdir, f"test_lock_multiprocess.{random()}.tmp")  # NOSONAR
+        file = os.path.join(tmpdir, f"test_lock_multiprocess.{random()}.tmp")
 
-        processes = list()
+        processes = []
         pool = multiprocessing.Pool()
         for _ in range(0, min(10, multiprocessing.cpu_count() - 1)):
             processes.append(pool.apply_async(check_lock, (file,)))
@@ -128,11 +128,11 @@ class TestFileLock:
         pool.close()
         pool.join()
 
-        assert all([x.get() for x in processes])
+        assert all(x.get() for x in processes)
 
     def test_lock_bad_lock_filenames(self, tmpdir: Path) -> None:
         """Test the lock with bad lock filenames."""
-        file = os.path.join(tmpdir, f"test_lock_bad_lock_filenames.{random()}.tmp")  # NOSONAR
+        file = os.path.join(tmpdir, f"test_lock_bad_lock_filenames.{random()}.tmp")
 
         with FileLock(file, wait_period=1, time_out_seconds=2, maximum_age=10) as lock:
             assert lock._lock_is_current("not a lock file") is False

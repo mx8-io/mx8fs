@@ -20,7 +20,8 @@ TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR TH
 import os
 import random
 import string
-from typing import Any, Callable, List, Optional, Union
+from collections.abc import Callable
+from typing import Any
 
 from mx8fs import delete_file, file_exists, list_files, read_file, write_file
 
@@ -32,7 +33,8 @@ class JsonFileStorage:
     _key_field: str
     _randomizer: Callable[[], None] = random.seed
 
-    def __init__(self, base_path: str, randomizer: Optional[Callable[[], None]] = None) -> None:
+    def __init__(self, base_path: str, randomizer: Callable[[], None] | None = None) -> None:
+        """Initialize storage with a base path and optional randomizer."""
         self.base_path = base_path
         self._randomizer = randomizer or self._randomizer
 
@@ -54,12 +56,11 @@ class JsonFileStorage:
         raise NotImplementedError()
 
     def _get_unique_key(self, key_length: int = 8) -> str:
-        """Create a eight letter unique key. This gives us nearly 3 trillion possibities"""
-
+        """Create a eight letter unique key. This gives us nearly 3 trillion possibities."""
         self.randomizer()
 
         # Generate a random key
-        key: str = "".join(random.choices(string.ascii_uppercase + string.digits, k=key_length))  # NOSONAR
+        key: str = "".join(random.choices(string.ascii_uppercase + string.digits, k=key_length))
 
         # If the key already exists, try again
         if file_exists(self._get_path(key)):
@@ -67,23 +68,20 @@ class JsonFileStorage:
 
         return key
 
-    def list(self) -> List[str]:
+    def list(self) -> list[str]:
         """List files in storage."""
-
         return list_files(self.base_path, self._extension)
 
     def read(self, key: str) -> Any:
         """Read a file from storage."""
-
         return self._json_to_model(read_file(self._get_path(key)))
 
-    def write(self, content: Any, key: Union[str, None] = None) -> Any:
+    def write(self, content: Any, key: str | None = None) -> Any:
         """Write a file to storage."""
         return self.write_dict(content.model_dump(), key)
 
-    def write_dict(self, content: dict, key: Union[str, None] = None) -> Any:
+    def write_dict(self, content: dict, key: str | None = None) -> Any:
         """Write a file to storage."""
-
         # If no key is provided, generate a unique key
         key = key or content.get(self._key_field, None)
         if not key:
@@ -98,7 +96,6 @@ class JsonFileStorage:
 
     def update(self, content: Any) -> Any:
         """Update a file in storage."""
-
         write_file(
             self._get_path(getattr(content, self._key_field)),
             self._model_to_json(content),
@@ -107,7 +104,6 @@ class JsonFileStorage:
 
     def delete(self, key: str) -> None:
         """Delete a file from storage."""
-
         delete_file(self._get_path(key))
 
     def _get_path(self, key: str) -> str:
@@ -117,7 +113,6 @@ class JsonFileStorage:
 
 def json_file_storage_factory(extension: str, model: Any, key_field: str = "key") -> type[JsonFileStorage]:
     """Create a file storage class."""
-
     cls: type[JsonFileStorage] = type(f"{model.__class__}Storage", (JsonFileStorage,), {})
 
     def _json_to_model(json: str) -> Any:
@@ -135,10 +130,10 @@ def json_file_storage_factory(extension: str, model: Any, key_field: str = "key"
 
         return str(content.model_dump_json())
 
-    setattr(cls, "_json_to_model", staticmethod(_json_to_model))
-    setattr(cls, "_dict_to_model", staticmethod(_dict_to_model))
-    setattr(cls, "_model_to_json", staticmethod(_model_to_json))
-    setattr(cls, "_extension", extension)
-    setattr(cls, "_key_field", key_field)
+    cls._json_to_model = staticmethod(_json_to_model)  # type: ignore[method-assign]
+    cls._dict_to_model = staticmethod(_dict_to_model)  # type: ignore[method-assign]
+    cls._model_to_json = staticmethod(_model_to_json)  # type: ignore[method-assign]
+    cls._extension = extension
+    cls._key_field = key_field
 
     return cls

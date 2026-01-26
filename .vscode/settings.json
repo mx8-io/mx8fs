@@ -22,10 +22,6 @@
   "files.exclude": {
     "**/.pytest_cache": true
   },
-  "sonarlint.connectedMode.project": {
-    "connectionId": "mx8-io",
-    "projectKey": "mx8-io_python-lib"
-  },
   "python.analysis.exclude": [
     "tests/test_data/",
     "cdk.out/",

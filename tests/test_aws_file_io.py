@@ -20,7 +20,7 @@ TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR TH
 
 import os
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -732,7 +732,7 @@ def test_get_files_and_purge_local_with_cutoff(path: str, tmp_path: Path) -> Non
 
     # Ensure different LastModified timestamps
     time.sleep(2)
-    cutoff = datetime.now(timezone.utc)
+    cutoff = datetime.now(UTC)
     time.sleep(2)
 
     # Create the newer object

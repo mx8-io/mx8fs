@@ -20,8 +20,9 @@ TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR TH
 
 import json
 import os
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 import pytest
 
@@ -230,12 +231,11 @@ def test_obfuscate_parameters_top_and_nested(save_dict: Callable[[Any], str]) ->
     correct_file = save_dict({})
     comparer.get_dict_differences(test_file, correct_file)
     obfuscated = json.loads(read_file(correct_file))
-    from mx8fs.comparer import ResultsComparer as RC
 
     assert obfuscated["TWILIO_AUTH_TOKEN"].startswith("OBFUSCATED-")
-    assert obfuscated["TWILIO_AUTH_TOKEN"] == RC._obfuscate_value("secret1")
-    assert obfuscated["nested"]["SQUARE_ACCESS_TOKEN"] == RC._obfuscate_value("secret2")
-    assert obfuscated["nested"]["list"][0]["TWILIO_TEST_AUTH_TOKEN"] == RC._obfuscate_value("secret3")
+    assert obfuscated["TWILIO_AUTH_TOKEN"] == ResultsComparer._obfuscate_value("secret1")
+    assert obfuscated["nested"]["SQUARE_ACCESS_TOKEN"] == ResultsComparer._obfuscate_value("secret2")
+    assert obfuscated["nested"]["list"][0]["TWILIO_TEST_AUTH_TOKEN"] == ResultsComparer._obfuscate_value("secret3")
     assert obfuscated["nested"]["list"][1]["other"] == "value"
 
 
