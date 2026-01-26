@@ -56,7 +56,7 @@ class JsonFileStorage:
         raise NotImplementedError()
 
     def _get_unique_key(self, key_length: int = 8) -> str:
-        """Create a eight letter unique key. This gives us nearly 3 trillion possibities."""
+        """Create a eight letter unique key. This gives us nearly 3 trillion possibilities."""
         self.randomizer()
 
         # Generate a random key

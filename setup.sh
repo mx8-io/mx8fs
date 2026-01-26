@@ -8,7 +8,7 @@ echo -e "\033[1;36m===============================================\033[0m"
 poetry lock
 poetry install
 poetry run pre-commit install
-pre-commit autoupdate
+poetry run pre-commit autoupdate
 poetry run pytest tests
 poetry run pre-commit run --all-files
 
