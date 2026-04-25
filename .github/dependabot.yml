@@ -9,3 +9,6 @@ updates:
       prefix: "fix"
       include: "scope"
     open-pull-requests-limit: 10
+    groups:
+      default:
+        patterns: ["*"]
