@@ -265,7 +265,7 @@ Below are the functions and classes exported by the library (`mx8fs.__all__`). P
 ### JSON Storage
 
 - `class JsonFileStorage(base_path: str, randomizer: Callable | None = None)`: Base class for simple JSON model storage.
-  - Methods: `list()`, `read(key)`, `write(model)`, `write_dict(dict, key=None)`, `update(model)`, `delete(key)`.
+  - Methods: `list()`, `read(key)`, `write(model)`, `write_dict(dict, key=None)`, `update(model)`, `delete(key)`, `get_lock(key, wait_period=0.1, time_out_seconds=840, maximum_age=900)`.
   - Implements unique key generation and defers serialization to subclass hooks.
 
   Example (using factory below for a Pydantic model): see next section.
@@ -286,7 +286,8 @@ Below are the functions and classes exported by the library (`mx8fs.__all__`). P
   store = UserStorage('/tmp/users')
 
   u = store.write(User(name='Ada'))     # auto-keyed
-  u = store.update(User(key=u.key, name='Ada Lovelace'))
+  with store.get_lock(u.key):
+      u = store.update(User(key=u.key, name='Ada Lovelace'))
   got = store.read(u.key)
   all_keys = store.list()
   store.delete(u.key)
