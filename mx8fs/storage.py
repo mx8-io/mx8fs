@@ -23,7 +23,7 @@ import string
 from collections.abc import Callable
 from typing import Any
 
-from mx8fs import delete_file, file_exists, list_files, read_file, write_file
+from mx8fs import FileLock, delete_file, file_exists, list_files, read_file, write_file
 
 
 class JsonFileStorage:
@@ -107,6 +107,21 @@ class JsonFileStorage:
     def delete(self, key: str) -> None:
         """Delete a file from storage."""
         delete_file(self._get_path(key))
+
+    def get_lock(
+        self,
+        key: str,
+        wait_period: float = 0.1,
+        time_out_seconds: int = 840,
+        maximum_age: int = 900,
+    ) -> FileLock:
+        """Get a file lock for the stored file."""
+        return FileLock(
+            self._get_path(key),
+            wait_period=wait_period,
+            time_out_seconds=time_out_seconds,
+            maximum_age=maximum_age,
+        )
 
     def _get_path(self, key: str) -> str:
         """Get the path for a file."""

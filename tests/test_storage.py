@@ -19,13 +19,14 @@ TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR TH
 
 # pylint: disable=protected-access
 
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
 import pytest
 from pydantic import BaseModel
 
-from mx8fs import JsonFileStorage, json_file_storage_factory
+from mx8fs import FileLock, JsonFileStorage, json_file_storage_factory
 
 
 class StorageTestClass(BaseModel):
@@ -93,6 +94,29 @@ def test_get_path(file_storage: JsonFileStorage) -> None:
     path = file_storage._get_path("file1")
     expected_path = file_storage.base_path + "/file1.txt"
     assert path == expected_path
+
+
+def test_get_lock(file_storage: JsonFileStorage) -> None:
+    """Test the get_lock method."""
+    lock = file_storage.get_lock("file1")
+
+    assert isinstance(lock, FileLock)
+    assert lock.file == file_storage._get_path("file1")
+
+
+def test_get_lock_custom_parameters(file_storage: JsonFileStorage) -> None:
+    """Test the get_lock method with custom parameters."""
+    lock = file_storage.get_lock(
+        "file1",
+        wait_period=0.5,
+        time_out_seconds=10,
+        maximum_age=20,
+    )
+
+    assert lock.file == file_storage._get_path("file1")
+    assert lock.waiter.wait_period == 0.5
+    assert lock.waiter.time_out_seconds == 10
+    assert lock.maximum_age == timedelta(seconds=20)
 
 
 def test_get_unique_key(file_storage: JsonFileStorage) -> None:
