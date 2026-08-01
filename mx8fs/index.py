@@ -519,7 +519,13 @@ class IndexManager[ModelT]:
                     self.index.table.c[NAMESPACE_COLUMN] == self.namespace,
                     self.index.table.c[self.index.key_field] == key,
                 )
-                .values(**{name: value for name, value in values.items() if name != NAMESPACE_COLUMN})
+                .values(
+                    **{
+                        name: value
+                        for name, value in values.items()
+                        if name not in {NAMESPACE_COLUMN, self.index.key_field}
+                    }
+                )
             )
             if result.rowcount == 0:
                 connection.execute(insert(self.index.table).values(**values))
@@ -577,9 +583,9 @@ class StorageQuery[ModelT]:
 
     def _validate_expression(self, expression: ColumnElement[Any]) -> None:
         table = self._storage.index.table
-        for element in visitors.iterate(expression):
-            if isinstance(element, Column) and element.table is not table:
-                raise ValueError("Query expressions must use columns from this storage index")
+        columns = [element for element in visitors.iterate(expression) if isinstance(element, Column)]
+        if not columns or any(column.table is not table for column in columns):
+            raise ValueError("Query expressions must use columns from this storage index")
 
     def where(self, *conditions: ColumnElement[bool]) -> StorageQuery[ModelT]:
         """Add SQLAlchemy filter expressions."""

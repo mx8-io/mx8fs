@@ -12,7 +12,7 @@ from uuid import UUID, uuid4
 
 import pytest
 from pydantic import BaseModel, Field
-from sqlalchemy import BigInteger, Column, MetaData, String, Table, create_engine, delete, insert, inspect, update
+from sqlalchemy import BigInteger, Column, MetaData, String, Table, create_engine, delete, insert, inspect, text, update
 from sqlalchemy.exc import DatabaseError
 
 import mx8fs
@@ -258,6 +258,10 @@ def test_query_validation(tmp_path: Path) -> None:
         storage.query().where(other.c.status == "pending")
     with pytest.raises(ValueError, match="this storage"):
         storage.query().order_by(other.c.status)
+    with pytest.raises(ValueError, match="this storage"):
+        storage.query().where(cast(Any, text("1 = 1")))
+    with pytest.raises(ValueError, match="this storage"):
+        storage.query().order_by(cast(Any, text("status")))
     with pytest.raises(ValueError, match="non-negative"):
         storage.query().limit(-1)
     with pytest.raises(ValueError, match="non-negative"):
@@ -522,6 +526,8 @@ def test_corrupt_database_may_disappear_before_preservation(tmp_path: Path, monk
 
 
 def test_optional_export_errors(monkeypatch: pytest.MonkeyPatch) -> None:
+    assert mx8fs._OPTIONAL_EXPORTS.isdisjoint(mx8fs.__all__)
+
     with pytest.raises(AttributeError):
         mx8fs.__getattr__("not_an_export")
 

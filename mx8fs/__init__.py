@@ -38,17 +38,17 @@ from .lock import FileLock, Waiter
 from .storage import JsonFileStorage, json_file_storage_factory
 
 if TYPE_CHECKING:  # pragma: no cover
-    from .index import (
-        IndexRebuildResult,
-        IndexSchemaError,
-        IndexUpdateError,
-        InvalidIndexError,
-        JsonIndex,
-        MissingIndexError,
-        StorageQuery,
-        json_index_factory,
+    from .index import (  # noqa: I001 - same-name aliases mark optional exports for mypy
+        IndexRebuildResult as IndexRebuildResult,
+        IndexSchemaError as IndexSchemaError,
+        IndexUpdateError as IndexUpdateError,
+        InvalidIndexError as InvalidIndexError,
+        JsonIndex as JsonIndex,
+        MissingIndexError as MissingIndexError,
+        StorageQuery as StorageQuery,
+        json_index_factory as json_index_factory,
     )
-    from .indexed_storage import IndexedJsonFileStorage
+    from .indexed_storage import IndexedJsonFileStorage as IndexedJsonFileStorage
 
 _OPTIONAL_EXPORTS = {
     "IndexedJsonFileStorage",
@@ -110,23 +110,14 @@ __all__ = [
     "get_public_url",
     "get_files",
     "get_folders",
-    "IndexedJsonFileStorage",
-    "IndexRebuildResult",
-    "IndexSchemaError",
-    "IndexUpdateError",
-    "InvalidIndexError",
     "json_file_storage_factory",
-    "json_index_factory",
-    "JsonIndex",
     "JsonFileStorage",
     "list_files",
     "most_recent_timestamp",
     "move_file",
-    "MissingIndexError",
     "read_file_with_version",
     "read_file",
     "ResultsComparer",
-    "StorageQuery",
     "update_file_if_version_matches",
     "VersionMismatchError",
     "Waiter",
