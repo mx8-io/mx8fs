@@ -264,8 +264,10 @@ Below are the functions and classes exported by the library (`mx8fs.__all__`). P
 
 ### JSON Storage
 
+Install JSON storage dependencies with `pip install "mx8fs[json-storage]"`.
+
 - `class JsonFileStorage(base_path: str, randomizer: Callable | None = None)`: Base class for simple JSON model storage.
-  - Methods: `list()`, `read(key)`, `write(model)`, `write_dict(dict, key=None)`, `update(model)`, `delete(key)`, `get_lock(key, wait_period=0.1, time_out_seconds=840, maximum_age=900)`.
+  - Methods: `list()`, `read(key)`, `read_many(keys, max_workers=None)`, `write(model)`, `write_dict(dict, key=None)`, `update(model)`, `delete(key)`, `get_lock(key, wait_period=0.1, time_out_seconds=840, maximum_age=900)`.
   - Implements unique key generation and defers serialization to subclass hooks.
 
   Example (using factory below for a Pydantic model): see next section.
@@ -292,6 +294,57 @@ Below are the functions and classes exported by the library (`mx8fs.__all__`). P
   all_keys = store.list()
   store.delete(u.key)
   ```
+
+### Indexed JSON Storage
+
+`json_index_factory` adds a SQL secondary index while keeping JSON files canonical. Local storage uses a hidden SQLite database at `<base_path>/.mx8fs-index.sqlite3`; indexed S3 storage uses Aurora DSQL.
+
+Use `pip install "mx8fs[indexed-json-storage]"` for indexed storage. It uses SQLite locally and Aurora DSQL for S3 storage.
+
+```python
+from datetime import datetime
+from pydantic import BaseModel
+from mx8fs import json_file_storage_factory, json_index_factory
+
+class Job(BaseModel):
+    key: str | None = None
+    status: str
+    created_at: datetime
+    not_before: datetime | None = None
+
+JobIndex = json_index_factory(
+    Job,
+    fields=["status", "created_at", "not_before"],
+    table_name="jobs",  # optional; otherwise derived from the model
+)
+
+JobStorage = json_file_storage_factory("json", Job, index=JobIndex)
+jobs = JobStorage("/tmp/jobs")
+
+query = (
+    jobs.query()
+    .where(jobs.index.status == "pending")
+    .order_by(jobs.index.created_at.desc())
+    .page(1, 50)
+)
+
+rows = query.all()       # SQLAlchemy RowMapping objects: key + indexed fields
+keys = query.keys()      # ordered keys only
+total = query.count()    # count before limit/offset
+models = query.models()  # concurrently load and validate the JSON models
+```
+
+Every index definition is fingerprinted from the selected Pydantic fields. Missing or incompatible index tables are logged, recreated under a shared SQL lease, and rebuilt automatically from the canonical JSON files. Different storage paths using the same definition share a physical table but remain isolated by an internal namespace. Older fingerprinted table versions are retained for compatibility with older deployments.
+
+Indexed S3 storage requires `MX8FS_DSQL_ENDPOINT`. `MX8FS_DSQL_USER` defaults to `admin`, and `MX8FS_DSQL_DATABASE` defaults to `postgres`. AWS credentials and Region resolution use the normal AWS chain.
+
+`rebuild_index()` can be called to force a full reconciliation. Indexed mutations already acquire re-entrant per-key file locks, so an explicit read-modify-write lock remains safe:
+
+```python
+with jobs.get_lock("job-key"):
+    job = jobs.read("job-key")
+    jobs.update(job.model_copy(update={"status": "complete"}))
+```
 
 ### Comparison Utilities
 
