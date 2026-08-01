@@ -17,16 +17,25 @@ OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHE
 TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 """
 
+from __future__ import annotations
+
+import builtins
 import os
 import random
 import string
 from collections.abc import Callable
-from typing import Any
+from concurrent.futures import ThreadPoolExecutor
+from typing import TYPE_CHECKING, Any, cast, overload
 
-from mx8fs import FileLock, delete_file, file_exists, list_files, read_file, write_file
+from .file_io import delete_file, file_exists, list_files, read_file, write_file
+from .lock import FileLock
+
+if TYPE_CHECKING:  # pragma: no cover
+    from .index import JsonIndex
+    from .indexed_storage import IndexedJsonFileStorage
 
 
-class JsonFileStorage:
+class JsonFileStorage[ModelT]:
     """A storage class for JSON serializable pydantic models."""
 
     _extension: str
@@ -44,15 +53,15 @@ class JsonFileStorage:
         self.randomizer = randomizer or random.seed
 
     @staticmethod
-    def _json_to_model(json: str) -> Any:  # pragma: no cover
+    def _json_to_model(json: str) -> ModelT:  # pragma: no cover
         raise NotImplementedError()
 
     @staticmethod
-    def _dict_to_model(json: dict) -> Any:  # pragma: no cover
+    def _dict_to_model(json: dict[str, Any]) -> ModelT:  # pragma: no cover
         raise NotImplementedError()
 
     @staticmethod
-    def _model_to_json(content: Any) -> str:  # pragma: no cover
+    def _model_to_json(content: ModelT) -> str:  # pragma: no cover
         raise NotImplementedError()
 
     def _get_unique_key(self, key_length: int = 8) -> str:
@@ -74,15 +83,22 @@ class JsonFileStorage:
         """List files in storage."""
         return list_files(self.base_path, self._extension)
 
-    def read(self, key: str) -> Any:
+    def read(self, key: str) -> ModelT:
         """Read a file from storage."""
         return self._json_to_model(read_file(self._get_path(key)))
 
-    def write(self, content: Any, key: str | None = None) -> Any:
-        """Write a file to storage."""
-        return self.write_dict(content.model_dump(), key)
+    def read_many(self, keys: builtins.list[str], max_workers: int | None = None) -> builtins.list[ModelT]:
+        """Read multiple models concurrently while preserving key order."""
+        if not keys:
+            return []
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            return list(executor.map(self.read, keys))
 
-    def write_dict(self, content: dict, key: str | None = None) -> Any:
+    def write(self, content: ModelT, key: str | None = None) -> ModelT:
+        """Write a file to storage."""
+        return self.write_dict(cast(Any, content).model_dump(), key)
+
+    def write_dict(self, content: dict[str, Any], key: str | None = None) -> ModelT:
         """Write a file to storage."""
         # If no key is provided, generate a unique key
         key = key or content.get(self._key_field, None)
@@ -96,7 +112,7 @@ class JsonFileStorage:
         # Now write the file
         return self.update(content_out)
 
-    def update(self, content: Any) -> Any:
+    def update(self, content: ModelT) -> ModelT:
         """Update a file in storage."""
         write_file(
             self._get_path(getattr(content, self._key_field)),
@@ -128,29 +144,66 @@ class JsonFileStorage:
         return os.path.join(self.base_path, f"{key}.{self._extension}")
 
 
-def json_file_storage_factory(extension: str, model: Any, key_field: str = "key") -> type[JsonFileStorage]:
+@overload
+def json_file_storage_factory[ModelT](
+    extension: str,
+    model: type[ModelT],
+    key_field: str = "key",
+    *,
+    index: None = None,
+) -> type[JsonFileStorage[ModelT]]: ...
+
+
+@overload
+def json_file_storage_factory[ModelT](
+    extension: str,
+    model: type[ModelT],
+    key_field: str = "key",
+    *,
+    index: JsonIndex[ModelT],
+) -> type[IndexedJsonFileStorage[ModelT]]: ...
+
+
+def json_file_storage_factory[ModelT](
+    extension: str,
+    model: type[ModelT],
+    key_field: str = "key",
+    *,
+    index: JsonIndex[ModelT] | None = None,
+) -> type[JsonFileStorage[ModelT]]:
     """Create a file storage class."""
-    cls: type[JsonFileStorage] = type(f"{model.__class__}Storage", (JsonFileStorage,), {})
+    if index is not None and (index.model is not model or index.key_field != key_field):
+        raise ValueError("The index model and key field must match the storage factory")
+    if index is not None:
+        from .indexed_storage import IndexedJsonFileStorage
 
-    def _json_to_model(json: str) -> Any:
+        base = cast(type[JsonFileStorage[ModelT]], IndexedJsonFileStorage)
+    else:
+        base = JsonFileStorage
+    cls = cast(type[JsonFileStorage[ModelT]], type(f"{model.__name__}Storage", (base,), {}))
+
+    def _json_to_model(json: str) -> ModelT:
         """Convert a JSON object to a model."""
-        return model.model_validate_json(json)
+        return cast(ModelT, cast(Any, model).model_validate_json(json))
 
-    def _dict_to_model(json: dict) -> Any:
+    def _dict_to_model(json: dict[str, Any]) -> ModelT:
         """Convert a dictionary to a model."""
         return model(**json)
 
-    def _model_to_json(content: Any) -> str:
+    def _model_to_json(content: ModelT) -> str:
         """Convert a model to a JSON object."""
         if not isinstance(content, model):  # pragma: no cover
             raise ValueError(f"Expected {model}, got {type(content)}")
 
-        return str(content.model_dump_json())
+        return str(cast(Any, content).model_dump_json())
 
     cls._json_to_model = staticmethod(_json_to_model)  # type: ignore[method-assign]
     cls._dict_to_model = staticmethod(_dict_to_model)  # type: ignore[method-assign]
     cls._model_to_json = staticmethod(_model_to_json)  # type: ignore[method-assign]
     cls._extension = extension
     cls._key_field = key_field
+
+    if index is not None:
+        cast(Any, cls)._index_definition = index
 
     return cls

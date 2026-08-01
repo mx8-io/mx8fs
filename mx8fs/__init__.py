@@ -8,6 +8,10 @@ You shall not disclose such Confidential Information and shall use it only
 in accordance with the terms of the agreement you entered into with MX8.
 """
 
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Any
+
 from .cache import cache_to_disk, cache_to_disk_binary, get_cache_filename
 from .comparer import ResultsComparer
 from .file_io import (
@@ -33,6 +37,65 @@ from .file_io import (
 from .lock import FileLock, Waiter
 from .storage import JsonFileStorage, json_file_storage_factory
 
+if TYPE_CHECKING:  # pragma: no cover
+    from .index import (
+        IndexRebuildResult,
+        IndexSchemaError,
+        IndexUpdateError,
+        InvalidIndexError,
+        JsonIndex,
+        MissingIndexError,
+        StorageQuery,
+        json_index_factory,
+    )
+    from .indexed_storage import IndexedJsonFileStorage
+
+_OPTIONAL_EXPORTS = {
+    "IndexedJsonFileStorage",
+    "IndexRebuildResult",
+    "IndexSchemaError",
+    "IndexUpdateError",
+    "InvalidIndexError",
+    "JsonIndex",
+    "MissingIndexError",
+    "StorageQuery",
+    "json_index_factory",
+}
+
+
+def _load_optional_export(name: str) -> Any:
+    if name == "IndexedJsonFileStorage":
+        from .indexed_storage import IndexedJsonFileStorage
+
+        return IndexedJsonFileStorage
+    from . import index
+
+    return {
+        "IndexRebuildResult": index.IndexRebuildResult,
+        "IndexSchemaError": index.IndexSchemaError,
+        "IndexUpdateError": index.IndexUpdateError,
+        "InvalidIndexError": index.InvalidIndexError,
+        "JsonIndex": index.JsonIndex,
+        "MissingIndexError": index.MissingIndexError,
+        "StorageQuery": index.StorageQuery,
+        "json_index_factory": index.json_index_factory,
+    }[name]
+
+
+def __getattr__(name: str) -> Any:
+    """Load indexed-storage exports only when their optional dependencies are installed."""
+    if name not in _OPTIONAL_EXPORTS:
+        raise AttributeError(name)
+    try:
+        value = _load_optional_export(name)
+    except ModuleNotFoundError as error:
+        raise ModuleNotFoundError(
+            f"{name} requires the mx8fs indexed-storage extra; install mx8fs[indexed-json-storage]"
+        ) from error
+    globals()[name] = value
+    return value
+
+
 __all__ = [
     "BinaryFileHandler",
     "GzipFileHandler",
@@ -47,14 +110,23 @@ __all__ = [
     "get_public_url",
     "get_files",
     "get_folders",
+    "IndexedJsonFileStorage",
+    "IndexRebuildResult",
+    "IndexSchemaError",
+    "IndexUpdateError",
+    "InvalidIndexError",
     "json_file_storage_factory",
+    "json_index_factory",
+    "JsonIndex",
     "JsonFileStorage",
     "list_files",
     "most_recent_timestamp",
     "move_file",
+    "MissingIndexError",
     "read_file_with_version",
     "read_file",
     "ResultsComparer",
+    "StorageQuery",
     "update_file_if_version_matches",
     "VersionMismatchError",
     "Waiter",
