@@ -110,7 +110,11 @@ def _new_index_engine(key: tuple[str, ...]) -> tuple[Engine, str | None]:
 def _index_engine_lock(key: tuple[str, ...]) -> threading.Lock:
     """Return the lock that serializes work for one index database."""
     with _index_engines_lock:
-        return _index_engine_locks.setdefault(key, threading.Lock())
+        lock = _index_engine_locks.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _index_engine_locks[key] = lock
+        return lock
 
 
 def _create_index_engine(base_path: str) -> tuple[Engine, str | None]:

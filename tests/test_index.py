@@ -279,9 +279,11 @@ def test_corrupt_engine_replacement_does_not_block_other_databases(
         assert other_done.wait(timeout=1)
     finally:
         release.set()
-        recovery_thread.join(timeout=1)
+        recovery_thread.join(timeout=5)
+        assert not recovery_thread.is_alive()
         if other_started:
-            other_thread.join(timeout=1)
+            other_thread.join(timeout=5)
+            assert not other_thread.is_alive()
 
     assert recovered
 
