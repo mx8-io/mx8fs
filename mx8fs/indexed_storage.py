@@ -30,6 +30,7 @@ logger = logging.getLogger("mx8.storage")
 
 _index_engines: dict[tuple[str, ...], tuple[Engine, str | None]] = {}
 _index_engines_lock = threading.Lock()
+_index_engine_locks: dict[tuple[str, ...], threading.Lock] = {}
 
 
 class _ReentrantFileLock(FileLock):
@@ -106,13 +107,24 @@ def _new_index_engine(key: tuple[str, ...]) -> tuple[Engine, str | None]:
     return engine, database_path
 
 
+def _index_engine_lock(key: tuple[str, ...]) -> threading.Lock:
+    """Return the lock that serializes work for one index database."""
+    with _index_engines_lock:
+        return _index_engine_locks.setdefault(key, threading.Lock())
+
+
 def _create_index_engine(base_path: str) -> tuple[Engine, str | None]:
     """Return the shared process-local engine for an index database."""
     key = _index_engine_key(base_path)
-    with _index_engines_lock:
-        if key not in _index_engines:
-            _index_engines[key] = _new_index_engine(key)
-        return _index_engines[key]
+    with _index_engine_lock(key):
+        with _index_engines_lock:
+            current = _index_engines.get(key)
+        if current is not None:
+            return current
+        current = _new_index_engine(key)
+        with _index_engines_lock:
+            _index_engines[key] = current
+        return current
 
 
 def _replace_corrupt_index_engine(
@@ -122,8 +134,9 @@ def _replace_corrupt_index_engine(
 ) -> tuple[Engine, str | None]:
     """Replace a corrupt cached SQLite engine once for this process."""
     key = _index_engine_key(base_path)
-    with _index_engines_lock:
-        current = _index_engines.get(key)
+    with _index_engine_lock(key):
+        with _index_engines_lock:
+            current = _index_engines.get(key)
         if current is not None and current[0] is not failed_engine:
             return current
         failed_engine.dispose()
@@ -132,7 +145,8 @@ def _replace_corrupt_index_engine(
                 timestamp = datetime.now().strftime("%Y%m%d%H%M%S%f")
                 os.replace(database_path, f"{database_path}.invalid-{timestamp}")
         replacement = _new_index_engine(key)
-        _index_engines[key] = replacement
+        with _index_engines_lock:
+            _index_engines[key] = replacement
         return replacement
 
 

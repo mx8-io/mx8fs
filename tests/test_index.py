@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import threading
 from datetime import UTC, date, datetime
 from decimal import Decimal
 from enum import Enum, StrEnum
@@ -231,6 +232,58 @@ def test_corrupt_engine_replacement_uses_existing_replacement(tmp_path: Path) ->
     assert replacement is current
     assert replacement_path == database_path
     failed.dispose()
+
+
+def test_corrupt_engine_replacement_does_not_block_other_databases(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    base_path = str(tmp_path / "corrupt")
+    failed, database_path = indexed_storage_module._create_index_engine(base_path)
+    entered = threading.Event()
+    release = threading.Event()
+    other_done = threading.Event()
+    recovered: list[Any] = []
+
+    class BlockingFileLock:
+        def __init__(self, *_: Any, **__: Any) -> None:
+            pass
+
+        def __enter__(self) -> BlockingFileLock:
+            entered.set()
+            release.wait()
+            return self
+
+        def __exit__(self, *_: Any) -> None:
+            pass
+
+    monkeypatch.setattr(indexed_storage_module, "FileLock", BlockingFileLock)
+    assert database_path is not None
+
+    recovery_thread = threading.Thread(
+        target=lambda: recovered.append(
+            indexed_storage_module._replace_corrupt_index_engine(base_path, failed, database_path)
+        )
+    )
+
+    def create_other() -> None:
+        indexed_storage_module._create_index_engine(str(tmp_path / "other"))
+        other_done.set()
+
+    other_thread = threading.Thread(target=create_other)
+    other_started = False
+    recovery_thread.start()
+    try:
+        assert entered.wait(timeout=1)
+        other_thread.start()
+        other_started = True
+        assert other_done.wait(timeout=1)
+    finally:
+        release.set()
+        recovery_thread.join(timeout=1)
+        if other_started:
+            other_thread.join(timeout=1)
+
+    assert recovered
 
 
 def test_indexed_crud_query_and_hydration(tmp_path: Path) -> None:
