@@ -28,6 +28,10 @@ from .storage import JsonFileStorage
 
 logger = logging.getLogger("mx8.storage")
 
+_index_engines: dict[tuple[str, ...], tuple[Engine, str | None]] = {}
+_index_engines_lock = threading.Lock()
+_index_engine_locks: dict[tuple[str, ...], threading.Lock] = {}
+
 
 class _ReentrantFileLock(FileLock):
     """Reuse a storage lock already held by this thread and storage instance."""
@@ -54,27 +58,43 @@ class _ReentrantFileLock(FileLock):
                 super().__exit__(*args, **kwargs)
 
 
-def _create_index_engine(base_path: str) -> tuple[Engine, str | None]:
+def _index_engine_key(base_path: str) -> tuple[str, ...]:
+    """Return the process-local identity of the index database."""
+    process = str(os.getpid())
     if base_path.startswith("s3://"):
         endpoint = os.getenv("MX8FS_DSQL_ENDPOINT")
         if not endpoint:
             raise ValueError("MX8FS_DSQL_ENDPOINT is required for indexed S3 storage")
+        return (
+            process,
+            "dsql",
+            endpoint,
+            os.getenv("MX8FS_DSQL_USER", "admin"),
+            os.getenv("MX8FS_DSQL_DATABASE", "postgres"),
+        )
+    database_path = os.path.realpath(os.path.join(base_path, ".mx8fs-index.sqlite3"))
+    return process, "sqlite", database_path
+
+
+def _new_index_engine(key: tuple[str, ...]) -> tuple[Engine, str | None]:
+    """Create an uncached SQLAlchemy engine for an index database."""
+    if key[1] == "dsql":
         from aurora_dsql_sqlalchemy import create_dsql_engine
         from botocore.httpsession import get_cert_path
 
         return (
             create_dsql_engine(
-                host=endpoint,
-                user=os.getenv("MX8FS_DSQL_USER", "admin"),
-                dbname=os.getenv("MX8FS_DSQL_DATABASE", "postgres"),
+                host=key[2],
+                user=key[3],
+                dbname=key[4],
                 driver="psycopg",
                 sslrootcert=get_cert_path(True),
             ),
             None,
         )
 
-    os.makedirs(base_path, exist_ok=True)
-    database_path = os.path.join(base_path, ".mx8fs-index.sqlite3")
+    database_path = key[2]
+    os.makedirs(os.path.dirname(database_path), exist_ok=True)
     engine = create_engine(f"sqlite:///{database_path}", connect_args={"timeout": 30})
 
     @event.listens_for(engine, "connect")
@@ -85,6 +105,53 @@ def _create_index_engine(base_path: str) -> tuple[Engine, str | None]:
         cursor.close()
 
     return engine, database_path
+
+
+def _index_engine_lock(key: tuple[str, ...]) -> threading.Lock:
+    """Return the lock that serializes work for one index database."""
+    with _index_engines_lock:
+        lock = _index_engine_locks.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _index_engine_locks[key] = lock
+        return lock
+
+
+def _create_index_engine(base_path: str) -> tuple[Engine, str | None]:
+    """Return the shared process-local engine for an index database."""
+    key = _index_engine_key(base_path)
+    with _index_engine_lock(key):
+        with _index_engines_lock:
+            current = _index_engines.get(key)
+        if current is not None:
+            return current
+        current = _new_index_engine(key)
+        with _index_engines_lock:
+            _index_engines[key] = current
+        return current
+
+
+def _replace_corrupt_index_engine(
+    base_path: str,
+    failed_engine: Engine,
+    database_path: str,
+) -> tuple[Engine, str | None]:
+    """Replace a corrupt cached SQLite engine once for this process."""
+    key = _index_engine_key(base_path)
+    with _index_engine_lock(key):
+        with _index_engines_lock:
+            current = _index_engines.get(key)
+        if current is not None and current[0] is not failed_engine:
+            return current
+        failed_engine.dispose()
+        with FileLock(database_path):
+            if os.path.exists(database_path):
+                timestamp = datetime.now().strftime("%Y%m%d%H%M%S%f")
+                os.replace(database_path, f"{database_path}.invalid-{timestamp}")
+        replacement = _new_index_engine(key)
+        with _index_engines_lock:
+            _index_engines[key] = replacement
+        return replacement
 
 
 def _is_corrupt_sqlite(error: DatabaseError) -> bool:
@@ -114,12 +181,7 @@ class IndexedJsonFileStorage[ModelT](JsonFileStorage[ModelT]):
             if database_path is None or not _is_corrupt_sqlite(error):
                 raise
             logger.exception("Local JSON index database is corrupt; preserving and recreating it")
-            engine.dispose()
-            with FileLock(database_path):
-                if os.path.exists(database_path):
-                    timestamp = datetime.now().strftime("%Y%m%d%H%M%S%f")
-                    os.replace(database_path, f"{database_path}.invalid-{timestamp}")
-            replacement, _ = _create_index_engine(self.base_path)
+            replacement, _ = _replace_corrupt_index_engine(self.base_path, engine, database_path)
             return IndexManager(replacement, self.index, self._namespace)
 
     def _lock_counts(self) -> dict[str, int]:
