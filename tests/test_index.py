@@ -210,6 +210,29 @@ def test_storage_factory_validates_index() -> None:
     assert not issubclass(plain_type, IndexedJsonFileStorage)
 
 
+def test_indexed_storage_reuses_engine_for_database(tmp_path: Path) -> None:
+    first = make_storage(tmp_path)
+    second = make_storage(Path(f"{tmp_path}/."))
+    other = make_storage(tmp_path / "other")
+
+    assert first._index_manager.engine is second._index_manager.engine
+    assert first._index_manager.engine is not other._index_manager.engine
+
+
+def test_corrupt_engine_replacement_uses_existing_replacement(tmp_path: Path) -> None:
+    current, database_path = indexed_storage_module._create_index_engine(str(tmp_path))
+    failed = create_engine("sqlite://")
+
+    assert database_path is not None
+    replacement, replacement_path = indexed_storage_module._replace_corrupt_index_engine(
+        str(tmp_path), failed, database_path
+    )
+
+    assert replacement is current
+    assert replacement_path == database_path
+    failed.dispose()
+
+
 def test_indexed_crud_query_and_hydration(tmp_path: Path) -> None:
     storage = make_storage(tmp_path)
     first = storage.write(record(None, "pending", 1), "a")
@@ -546,8 +569,11 @@ def test_dsql_configuration(monkeypatch: pytest.MonkeyPatch) -> None:
 
     sentinel = create_engine("sqlite://")
     calls: dict[str, Any] = {}
+    call_count = 0
 
     def fake_engine(**kwargs: Any) -> Any:
+        nonlocal call_count
+        call_count += 1
         calls.update(kwargs)
         return sentinel
 
@@ -559,9 +585,13 @@ def test_dsql_configuration(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("MX8FS_DSQL_DATABASE", "indexes")
 
     engine, path = indexed_storage_module._create_index_engine("s3://bucket/path")
+    shared_engine, shared_path = indexed_storage_module._create_index_engine("s3://other/path")
 
     assert engine is sentinel
     assert path is None
+    assert shared_engine is sentinel
+    assert shared_path is None
+    assert call_count == 1
     assert calls["host"] == "cluster.example"
     assert calls["user"] == "writer"
     assert calls["dbname"] == "indexes"
