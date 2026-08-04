@@ -27,7 +27,7 @@ from typing import Any
 
 import pytest
 import urllib3
-from botocore.stub import ANY, Stubber
+from botocore.stub import Stubber
 
 from mx8fs import (
     BinaryFileHandler,
@@ -466,28 +466,9 @@ def test_copy_file_aborts_interrupted_multipart_upload(monkeypatch: pytest.Monke
     monkeypatch.setattr("mx8fs.file_io._get_response", lambda _: nullcontext(InterruptedResponse()))
 
     with Stubber(s3_client) as stubber:
-        stubber.add_response(
-            "create_multipart_upload",
-            {"UploadId": "upload-id"},
-            {"Bucket": "bucket", "Key": "destination.bin", "ChecksumAlgorithm": "CRC32"},
-        )
-        stubber.add_response(
-            "upload_part",
-            {"ETag": "etag", "ChecksumCRC32": "checksum"},
-            {
-                "Bucket": "bucket",
-                "Key": "destination.bin",
-                "UploadId": "upload-id",
-                "PartNumber": 1,
-                "Body": ANY,
-                "ChecksumAlgorithm": "CRC32",
-            },
-        )
-        stubber.add_response(
-            "abort_multipart_upload",
-            {},
-            {"Bucket": "bucket", "Key": "destination.bin", "UploadId": "upload-id"},
-        )
+        stubber.add_response("create_multipart_upload", {"UploadId": "upload-id"})
+        stubber.add_response("upload_part", {"ETag": "etag"})
+        stubber.add_response("abort_multipart_upload", {})
 
         with pytest.raises(OSError, match="connection interrupted"):
             copy_file("https://example.test/source.bin", "s3://bucket/destination.bin")
