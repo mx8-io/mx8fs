@@ -403,6 +403,18 @@ def test_initialization_skips_malformed_records_and_completes_namespace(
     make_storage(tmp_path)
 
 
+def test_rebuild_does_not_delete_unindexed_malformed_record(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    storage = make_storage(tmp_path)
+    Path(storage._get_path("malformed")).write_text('{"key":"malformed"}', encoding="UTF-8")
+    deleted: list[str] = []
+    monkeypatch.setattr(storage._index_manager, "delete", deleted.append)
+
+    result = storage.rebuild_index()
+
+    assert result == index_module.IndexRebuildResult(upserted=0, removed=0)
+    assert deleted == []
+
+
 def test_rebuild_propagates_infrastructure_failures(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     storage = make_storage(tmp_path)
     storage.write(record("valid", "pending", 1))

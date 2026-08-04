@@ -231,7 +231,8 @@ class IndexedJsonFileStorage[ModelT](JsonFileStorage[ModelT]):
                 key,
                 error,
             )
-            self._index_manager.delete(key)
+            if was_indexed:
+                self._index_manager.delete(key)
             return IndexRebuildResult(upserted=0, removed=int(was_indexed))
         self._index_manager.upsert(model)
         return IndexRebuildResult(upserted=1, removed=0)
