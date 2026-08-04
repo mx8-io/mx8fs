@@ -19,6 +19,7 @@ TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR TH
 
 import gzip
 import os
+import stat
 import urllib.error
 import urllib.request
 from collections.abc import Generator
@@ -28,8 +29,10 @@ from datetime import UTC, datetime
 from glob import glob
 from io import BytesIO
 from typing import IO, Any, Literal, cast
+from uuid import uuid4
 
 import boto3
+from boto3.s3.transfer import TransferConfig
 from botocore.config import Config
 from urllib3 import HTTPResponse
 
@@ -49,6 +52,8 @@ s3_client = boto3.client(
 )
 
 S3_PREFIX = "s3://"
+_HTTPS_PREFIX = "https://"
+_S3_MULTIPART_CHUNK_SIZE = 8 * 1024 * 1024
 
 
 class VersionMismatchError(FileNotFoundError):
@@ -243,8 +248,77 @@ def delete_files(files: list[str], max_workers: int = 500) -> None:
         _delete_files_local(local_files, max_workers=max_workers)
 
 
+@contextmanager
+def _open_copy_source(path: str) -> Generator[Any, None, None]:
+    if path.startswith(S3_PREFIX):
+        bucket, key = get_bucket_key(path)
+        try:
+            body = s3_client.get_object(Bucket=bucket, Key=key)["Body"]
+        except s3_client.exceptions.ClientError as exc:
+            raise FileNotFoundError(f"File {path} not found") from exc
+
+        try:
+            yield body
+        finally:
+            body.close()
+    elif path.startswith(_HTTPS_PREFIX):
+        with _get_response(path) as response:
+            yield response
+    else:
+        with open(path, "rb") as source:
+            yield source
+
+
+def _copy_stream(source: Any, destination: IO[bytes], chunk_size: int) -> None:
+    while chunk := source.read(chunk_size):
+        destination.write(chunk)
+
+
+def _copy_to_s3(src: str, dst: str, chunk_size: int) -> None:
+    bucket, key = get_bucket_key(dst)
+    multipart_chunk_size = max(chunk_size, _S3_MULTIPART_CHUNK_SIZE)
+    transfer_config = TransferConfig(
+        multipart_threshold=multipart_chunk_size,
+        multipart_chunksize=multipart_chunk_size,
+        use_threads=False,
+    )
+
+    with _open_copy_source(src) as source:
+        try:
+            s3_client.upload_fileobj(
+                Fileobj=source,
+                Bucket=bucket,
+                Key=key,
+                Config=transfer_config,
+            )
+        except s3_client.exceptions.ClientError as exc:
+            raise PermissionError(f"Cannot write to {dst}.") from exc
+
+
+def _copy_to_local(src: str, dst: str, chunk_size: int) -> None:
+    destination_directory = os.path.dirname(dst) or "."
+    os.makedirs(destination_directory, exist_ok=True)
+    temporary_path = os.path.join(destination_directory, f".{os.path.basename(dst)}.{uuid4().hex}.tmp")
+    destination_mode = stat.S_IMODE(os.stat(dst).st_mode) if os.path.exists(dst) else None
+
+    try:
+        with _open_copy_source(src) as source:
+            with open(temporary_path, "xb") as destination:
+                _copy_stream(source, destination, chunk_size)
+
+        if destination_mode is not None:
+            os.chmod(temporary_path, destination_mode)
+        os.replace(temporary_path, dst)
+    finally:
+        if os.path.exists(temporary_path):
+            os.unlink(temporary_path)
+
+
 def copy_file(src: str, dst: str, chunk_size: int = 131072) -> None:
-    """Copy a file from S3 or local storage."""
+    """Copy a file between S3, HTTPS, and local storage."""
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be greater than zero")
+
     if src.startswith(S3_PREFIX) and dst.startswith(S3_PREFIX):
         src_bucket, src_key = get_bucket_key(src)
         dst_bucket, dst_key = get_bucket_key(dst)
@@ -257,14 +331,12 @@ def copy_file(src: str, dst: str, chunk_size: int = 131072) -> None:
             )
         except s3_client.exceptions.NoSuchKey as exc:
             raise FileNotFoundError(f"File {src} not found") from exc
+    elif dst.startswith(S3_PREFIX):
+        _copy_to_s3(src, dst, chunk_size)
+    elif dst.startswith(_HTTPS_PREFIX):
+        raise NotImplementedError("Only 'rb' mode is supported for https:// paths")
     else:
-        with BinaryFileHandler(src, "rb") as original_file:
-            with BinaryFileHandler(dst, "wb") as new_file:
-                while True:
-                    chunk = original_file.read(chunk_size)
-                    if not chunk:
-                        break
-                    new_file.write(chunk)
+        _copy_to_local(src, dst, chunk_size)
 
 
 def move_file(src: str, dst: str) -> None:

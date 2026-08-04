@@ -97,7 +97,7 @@ Below are the functions and classes exported by the library (`mx8fs.__all__`). P
   ])
   ```
 
-- `copy_file(src: str, dst: str, chunk_size: int = 131072) -> None`: Copy S3→S3 via `CopyObject`, or stream copy for all other combinations (S3/local/HTTPS read with `BinaryFileHandler`).
+- `copy_file(src: str, dst: str, chunk_size: int = 131072) -> None`: Copy between S3, local storage, and HTTPS sources with bounded memory. S3→S3 uses `CopyObject`; other S3 destinations use sequential multipart uploads, and local destinations are replaced atomically after a successful transfer.
 
   Example:
   ```python

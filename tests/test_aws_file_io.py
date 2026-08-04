@@ -20,11 +20,14 @@ TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR TH
 
 import os
 import time
+from contextlib import nullcontext
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import pytest
 import urllib3
+from botocore.stub import Stubber
 
 from mx8fs import (
     BinaryFileHandler,
@@ -43,7 +46,7 @@ from mx8fs import (
     update_file_if_version_matches,
     write_file,
 )
-from mx8fs.file_io import get_bucket_key, get_files, purge_folder
+from mx8fs.file_io import get_bucket_key, get_files, purge_folder, s3_client
 
 TEST_BUCKET_NAME = "mx8-test-bucket/mx8fs"
 
@@ -327,6 +330,162 @@ def test_copy_file(tmp_path: Path) -> None:
         # Delete the files
         delete_file(src_file)
         delete_file(dst_file)
+
+    local_source = tmp_path / "local-source.txt"
+    local_destination = tmp_path / "local-destination.txt"
+    https_destination = tmp_path / "https-destination.txt"
+    s3_destination = f"s3://{TEST_BUCKET_NAME}/copy-destination.txt"
+    https_s3_destination = f"s3://{TEST_BUCKET_NAME}/copy-https-destination.txt"
+    local_source.write_text("streamed test", encoding="UTF-8")
+
+    copy_file(str(local_source), s3_destination)
+    assert read_file(s3_destination) == "streamed test"
+
+    copy_file(s3_destination, str(local_destination))
+    assert local_destination.read_text(encoding="UTF-8") == "streamed test"
+
+    https_source = get_public_url(s3_destination)
+    copy_file(https_source, str(https_destination))
+    assert https_destination.read_text(encoding="UTF-8") == "streamed test"
+
+    copy_file(https_source, https_s3_destination)
+    assert read_file(https_s3_destination) == "streamed test"
+
+    missing_s3_source = f"s3://{TEST_BUCKET_NAME}/copy-missing-source.txt"
+    delete_file(missing_s3_source)
+    with pytest.raises(FileNotFoundError):
+        copy_file(missing_s3_source, str(local_destination))
+
+    delete_file(s3_destination)
+    delete_file(https_s3_destination)
+
+
+def test_copy_file_streams_https_source(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Test that HTTPS copies never read the complete response at once."""
+
+    class BoundedResponse:
+        def __init__(self, data: bytes) -> None:
+            self.data = data
+            self.offset = 0
+
+        def read(self, size: int = -1) -> bytes:
+            assert 0 < size <= 4
+            chunk = self.data[self.offset : self.offset + size]
+            self.offset += len(chunk)
+            return chunk
+
+    response = BoundedResponse(b"streamed content")
+    monkeypatch.setattr("mx8fs.file_io._get_response", lambda _: nullcontext(response))
+    destination = tmp_path / "destination.bin"
+    destination.write_bytes(b"old content")
+    destination.chmod(0o640)
+
+    copy_file("https://example.test/source.bin", str(destination), chunk_size=4)
+
+    assert destination.read_bytes() == b"streamed content"
+    assert destination.stat().st_mode & 0o777 == 0o640
+
+
+def test_copy_file_preserves_local_destination_on_interruption(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Test that interrupted copies do not publish partial local files."""
+
+    class InterruptedResponse:
+        calls = 0
+
+        def read(self, size: int = -1) -> bytes:
+            assert size == 4
+            self.calls += 1
+            if self.calls == 1:
+                return b"part"
+            raise OSError("connection interrupted")
+
+    monkeypatch.setattr("mx8fs.file_io._get_response", lambda _: nullcontext(InterruptedResponse()))
+    destination = tmp_path / "destination.bin"
+    destination.write_bytes(b"existing content")
+
+    with pytest.raises(OSError, match="connection interrupted"):
+        copy_file("https://example.test/source.bin", str(destination), chunk_size=4)
+
+    assert destination.read_bytes() == b"existing content"
+    assert list(tmp_path.iterdir()) == [destination]
+
+
+def test_copy_file_uses_bounded_s3_transfer(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Test that local-to-S3 copies use a bounded sequential managed transfer."""
+    source = tmp_path / "source.bin"
+    source.write_bytes(b"source content")
+    captured: dict[str, Any] = {}
+
+    def upload_fileobj(**kwargs: Any) -> None:
+        captured["data"] = kwargs["Fileobj"].read()
+        captured["bucket"] = kwargs["Bucket"]
+        captured["key"] = kwargs["Key"]
+        captured["config"] = kwargs["Config"]
+
+    monkeypatch.setattr(s3_client, "upload_fileobj", upload_fileobj)
+
+    copy_file(str(source), "s3://bucket/destination.bin")
+
+    assert captured["data"] == b"source content"
+    assert captured["bucket"] == "bucket"
+    assert captured["key"] == "destination.bin"
+    assert captured["config"].multipart_threshold == 8 * 1024 * 1024
+    assert captured["config"].multipart_chunksize == 8 * 1024 * 1024
+    assert captured["config"].use_threads is False
+
+
+def test_copy_file_translates_s3_write_errors(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Test that managed upload errors retain the existing public semantics."""
+    source = tmp_path / "source.bin"
+    source.write_bytes(b"source content")
+
+    def upload_fileobj(**_: Any) -> None:
+        raise s3_client.exceptions.ClientError(
+            {"Error": {"Code": "AccessDenied", "Message": "denied"}},
+            "CreateMultipartUpload",
+        )
+
+    monkeypatch.setattr(s3_client, "upload_fileobj", upload_fileobj)
+
+    with pytest.raises(PermissionError, match="Cannot write to s3://bucket/destination.bin"):
+        copy_file(str(source), "s3://bucket/destination.bin")
+
+
+def test_copy_file_aborts_interrupted_multipart_upload(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Test that interrupted HTTPS transfers abort their multipart upload."""
+
+    class InterruptedResponse:
+        calls = 0
+
+        def read(self, size: int = -1) -> bytes:
+            self.calls += 1
+            if self.calls == 1:
+                return b"x" * size
+            raise OSError("connection interrupted")
+
+    monkeypatch.setattr("mx8fs.file_io._get_response", lambda _: nullcontext(InterruptedResponse()))
+
+    with Stubber(s3_client) as stubber:
+        stubber.add_response("create_multipart_upload", {"UploadId": "upload-id"})
+        stubber.add_response("upload_part", {"ETag": "etag"})
+        stubber.add_response("abort_multipart_upload", {})
+
+        with pytest.raises(OSError, match="connection interrupted"):
+            copy_file("https://example.test/source.bin", "s3://bucket/destination.bin")
+
+        stubber.assert_no_pending_responses()
+
+
+def test_copy_file_rejects_invalid_options(tmp_path: Path) -> None:
+    """Test invalid copy destinations and buffer sizes."""
+    source = tmp_path / "source.bin"
+    source.write_bytes(b"source content")
+
+    with pytest.raises(ValueError, match="chunk_size must be greater than zero"):
+        copy_file(str(source), str(tmp_path / "destination.bin"), chunk_size=0)
+
+    with pytest.raises(NotImplementedError, match="Only 'rb' mode is supported"):
+        copy_file(str(source), "https://example.test/destination.bin")
 
 
 def test_move_file(tmp_path: Path) -> None:
