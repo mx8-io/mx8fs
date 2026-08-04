@@ -9,6 +9,7 @@ from collections.abc import Callable
 from datetime import datetime
 from typing import Any, cast
 
+from pydantic import ValidationError
 from sqlalchemy import create_engine, event
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import DatabaseError
@@ -221,24 +222,42 @@ class IndexedJsonFileStorage[ModelT](JsonFileStorage[ModelT]):
                 self._reconcile_index(lease)
                 self._index_manager.mark_namespace_ready()
 
+    def _reconcile_existing_file(self, key: str, was_indexed: bool) -> IndexRebuildResult:
+        try:
+            model = self.read(key)
+        except ValidationError as error:
+            logger.error(
+                "Skipping malformed JSON object key %s during index reconciliation: %s",
+                key,
+                error,
+            )
+            if was_indexed:
+                self._index_manager.delete(key)
+            return IndexRebuildResult(upserted=0, removed=int(was_indexed))
+        self._index_manager.upsert(model)
+        return IndexRebuildResult(upserted=1, removed=0)
+
     def _reconcile_index(self, lease: Any) -> IndexRebuildResult:
         current_keys = set(self.list())
+        indexed_keys = self._index_manager.indexed_keys()
         upserted = 0
         removed = 0
         for key in sorted(current_keys):
             with self.get_lock(key):
                 if file_exists(self._get_path(key)):
-                    self._index_manager.upsert(self.read(key))
-                    upserted += 1
+                    result = self._reconcile_existing_file(key, key in indexed_keys)
+                    upserted += result.upserted
+                    removed += result.removed
                 else:
                     self._index_manager.delete(key)
             lease.maybe_renew()
 
-        for key in sorted(self._index_manager.indexed_keys() - current_keys):
+        for key in sorted(indexed_keys - current_keys):
             with self.get_lock(key):
                 if file_exists(self._get_path(key)):
-                    self._index_manager.upsert(self.read(key))
-                    upserted += 1
+                    result = self._reconcile_existing_file(key, True)
+                    upserted += result.upserted
+                    removed += result.removed
                 else:
                     self._index_manager.delete(key)
                     removed += 1

@@ -12,7 +12,7 @@ from typing import Any, Literal, cast
 from uuid import UUID, uuid4
 
 import pytest
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 from sqlalchemy import BigInteger, Column, MetaData, String, Table, create_engine, delete, insert, inspect, text, update
 from sqlalchemy.exc import DatabaseError
 
@@ -373,6 +373,67 @@ def test_rebuild_repairs_missing_and_stale_rows(tmp_path: Path) -> None:
     assert result.upserted == 1
     assert result.removed == 1
     assert storage.query().keys() == ["a"]
+
+
+def test_initialization_skips_malformed_records_and_completes_namespace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    storage = make_storage(tmp_path)
+    storage.write(record("valid", "pending", 1))
+    storage.write(record("malformed", "stale", 2))
+    Path(storage._get_path("malformed")).write_text('{"key":"malformed"}', encoding="UTF-8")
+    with storage._index_manager.engine.begin() as connection:
+        connection.execute(delete(storage._index_manager.namespaces))
+
+    with caplog.at_level("ERROR", logger="mx8.storage"):
+        reconciled = make_storage(tmp_path)
+
+    assert reconciled.query().keys() == ["valid"]
+    assert reconciled._index_manager.namespace_ready()
+    assert "malformed" in caplog.text
+    assert "validation" in caplog.text.lower()
+    with pytest.raises(ValidationError):
+        reconciled.read("malformed")
+
+    monkeypatch.setattr(
+        indexed_storage_module.IndexedJsonFileStorage,
+        "_reconcile_index",
+        lambda *_: pytest.fail("completed namespace was rebuilt"),
+    )
+    make_storage(tmp_path)
+
+
+def test_rebuild_does_not_delete_unindexed_malformed_record(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    storage = make_storage(tmp_path)
+    Path(storage._get_path("malformed")).write_text('{"key":"malformed"}', encoding="UTF-8")
+    deleted: list[str] = []
+    monkeypatch.setattr(storage._index_manager, "delete", deleted.append)
+
+    result = storage.rebuild_index()
+
+    assert result == index_module.IndexRebuildResult(upserted=0, removed=0)
+    assert deleted == []
+
+
+def test_rebuild_propagates_infrastructure_failures(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    storage = make_storage(tmp_path)
+    storage.write(record("valid", "pending", 1))
+
+    def storage_failure(_: str) -> IndexedRecord:
+        raise OSError("storage unavailable")
+
+    monkeypatch.setattr(storage, "read", storage_failure)
+    with pytest.raises(OSError, match="storage unavailable"):
+        storage.rebuild_index()
+
+    monkeypatch.undo()
+
+    def database_failure(_: IndexedRecord) -> None:
+        raise RuntimeError("DSQL unavailable")
+
+    monkeypatch.setattr(storage._index_manager, "upsert", database_failure)
+    with pytest.raises(RuntimeError, match="DSQL unavailable"):
+        storage.rebuild_index()
 
 
 def test_update_failures_leave_canonical_json_and_raise(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
