@@ -38,7 +38,7 @@ Below are the functions and classes exported by the library (`mx8fs.__all__`). P
   content, version = read_file_with_version('s3://my-bucket/app/config.json')
   ```
 
-- `write_file(path: str, data: str) -> None`: Write UTF‑8 text to S3 or local. Creates parent directories for local writes.
+- `write_file(path: str, data: str) -> str`: Write UTF‑8 text to S3 or local and return its resulting version. Creates parent directories for local writes.
 
   Example:
   ```python
@@ -48,9 +48,9 @@ Below are the functions and classes exported by the library (`mx8fs.__all__`). P
   write_file('s3://my-bucket/logs/run.txt', 'done')
   ```
 
-- `update_file_if_version_matches(path: str, data: str, version: str) -> None`: Conditional write.
+- `update_file_if_version_matches(path: str, data: str, version: str) -> str`: Version-aware write that returns the resulting version.
   - S3: uses `IfMatch=<etag>`. Raises `VersionMismatchError` on mismatch, `FileNotFoundError` if key missing.
-  - Local: acquires a `FileLock`, compares mtime string; raises `VersionMismatchError` or `FileNotFoundError` similarly.
+  - Local: compares the nanosecond mtime and atomically replaces the file without a lock. Portable filesystems do not provide an atomic compare-and-replace primitive, so another process can still write between the comparison and replacement.
 
   Example (optimistic concurrency):
   ```python
@@ -366,10 +366,19 @@ def indexed_storages():
     ]
 ```
 
+Expose that callable as an installed package entry point so only registries explicitly declared by the application can be loaded:
+
+```toml
+[project.entry-points."mx8fs.index_registries"]
+application = "app.mx8fs_migrations:indexed_storages"
+```
+
+Poetry applications can declare the same mapping under `[tool.poetry.plugins."mx8fs.index_registries"]`.
+
 Install the indexed storage extra and run one deployment migration job before starting application replicas:
 
 ```bash
-mx8fs migrate-indexes app.mx8fs_migrations:indexed_storages \
+mx8fs migrate-indexes application \
   --jobs 4 \
   --total-read-workers 100
 ```
@@ -382,7 +391,7 @@ An advisory scanner helps find declarations that may be missing from the registr
 
 ```bash
 mx8fs discover-indexes ./src \
-  --registry app.mx8fs_migrations:indexed_storages
+  --registry application
 ```
 
 The scanner parses Python without importing it and reports indexed `json_file_storage_factory(..., index=...)` declarations with file and line numbers. It understands direct imports, aliases, and module-qualified calls. Its results are advisory: dynamic calls, wrappers, and runtime-generated storage paths may not be discoverable, and the scanner never performs migrations. The explicit registry remains authoritative.
@@ -390,7 +399,7 @@ The scanner parses Python without importing it and reports indexed `json_file_st
 All JSON storage exposes the same three update policies. Indexed storage adds index synchronization without acquiring per-record file locks:
 
 - `update(model)` always overwrites canonical JSON, then stabilizes its index from the latest canonical version.
-- `update_if_version(model, version)` performs one compare-and-swap attempt and raises `VersionMismatchError` rather than overwriting a newer version.
+- `update_if_version(model, version)` performs one version-matched update attempt and raises `VersionMismatchError` when the observed version is already stale. S3 provides atomic compare-and-swap through `If-Match`; local storage has the portable-filesystem race described above.
 - `mutate(key, function, max_attempts=3)` rereads and reapplies a side-effect-free mutation after version conflicts.
 
 ```python

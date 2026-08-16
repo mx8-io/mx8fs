@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import sys
 import types
 from pathlib import Path
 from typing import Any
@@ -49,23 +48,24 @@ def make_storages(
 
 def test_registry_loading_and_validation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     storage = make_storages(tmp_path, monkeypatch, count=1)[0]
-    module = types.ModuleType("test_registry")
-    module.__dict__.update(
-        targets=lambda: [storage],
-        not_callable=[],
-        bad_targets=lambda: [object()],
-    )
-    monkeypatch.setitem(sys.modules, module.__name__, module)
+    entries = [
+        types.SimpleNamespace(name="targets", load=lambda: lambda: [storage]),
+        types.SimpleNamespace(name="not-callable", load=lambda: []),
+        types.SimpleNamespace(name="bad-targets", load=lambda: lambda: [object()]),
+        types.SimpleNamespace(name="duplicate", load=lambda: lambda: []),
+        types.SimpleNamespace(name="duplicate", load=lambda: lambda: []),
+    ]
+    monkeypatch.setattr(migration_module, "entry_points", lambda **_: entries)
 
-    assert load_index_registry("test_registry:targets") == [storage]
-    with pytest.raises(ValueError, match="module:callable"):
-        load_index_registry("bad")
-    with pytest.raises(AttributeError):
-        load_index_registry("test_registry:missing")
+    assert load_index_registry("targets") == [storage]
+    with pytest.raises(ValueError, match="No installed"):
+        load_index_registry("missing")
+    with pytest.raises(ValueError, match="Multiple installed"):
+        load_index_registry("duplicate")
     with pytest.raises(TypeError, match="not callable"):
-        load_index_registry("test_registry:not_callable")
+        load_index_registry("not-callable")
     with pytest.raises(TypeError, match="only Indexed"):
-        load_index_registry("test_registry:bad_targets")
+        load_index_registry("bad-targets")
 
 
 def test_migrate_indexes_groups_schemas_deduplicates_and_budgets_workers(
@@ -181,12 +181,12 @@ def test_cli_discovery_and_migration_output(
 
     assert cli_module.main(["discover-indexes", str(tmp_path)]) == 0
     assert "app.py:4 Jobs" in capsys.readouterr().out
-    assert cli_module.main(["discover-indexes", str(tmp_path), "--registry", "app:targets"]) == 0
+    assert cli_module.main(["discover-indexes", str(tmp_path), "--registry", "application"]) == 0
     assert "Jobs registered" in capsys.readouterr().out
     monkeypatch.setattr(cli_module, "load_index_registry", lambda _: [])
-    assert cli_module.main(["discover-indexes", str(tmp_path), "--registry", "app:targets"]) == 0
+    assert cli_module.main(["discover-indexes", str(tmp_path), "--registry", "application"]) == 0
     assert "Jobs unregistered" in capsys.readouterr().out
-    assert cli_module.main(["discover-indexes", str(tmp_path), "--registry", "app:targets", "--json"]) == 0
+    assert cli_module.main(["discover-indexes", str(tmp_path), "--registry", "application", "--json"]) == 0
     assert json.loads(capsys.readouterr().out)[0]["registered"] is False
     assert cli_module.main(["migrate-indexes", "app:targets"]) == 0
     assert "Migrated Jobs /jobs" in capsys.readouterr().out

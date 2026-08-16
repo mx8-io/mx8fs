@@ -182,7 +182,7 @@ def update_file_if_version_matches(file: str, data: str, version: str) -> str:
             raise FileNotFoundError("File does not exist") from exc
         except s3_client.exceptions.ClientError as exc:
             if exc.response["Error"]["Code"] in ["PreconditionFailed", "ConditionalRequestConflict"]:
-                raise VersionMismatchError(f"File with the etag {version} does not exist") from exc
+                raise VersionMismatchError(f"File version does not match {version}") from exc
             else:  # pragma: no cover
                 raise exc
     else:
@@ -191,7 +191,7 @@ def update_file_if_version_matches(file: str, data: str, version: str) -> str:
         except FileNotFoundError as exc:
             raise FileNotFoundError(f"File {file} not found") from exc
         if current_version != version:
-            raise VersionMismatchError(f"File with the etag {version} does not exist")
+            raise VersionMismatchError(f"File version does not match {version}")
 
         directory = os.path.dirname(file) or "."
         descriptor, temporary_path = tempfile.mkstemp(dir=directory)

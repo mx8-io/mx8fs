@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import ast
-import importlib
 from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+from importlib.metadata import entry_points
 from pathlib import Path
 from time import perf_counter
 from typing import Any
@@ -26,6 +26,7 @@ _IGNORED_DIRECTORIES = {
     "node_modules",
     "venv",
 }
+_INDEX_REGISTRY_GROUP = "mx8fs.index_registries"
 
 
 @dataclass(frozen=True)
@@ -81,14 +82,16 @@ class DiscoveredIndex:
     symbol: str | None
 
 
-def load_index_registry(specification: str) -> list[IndexedJsonFileStorage[Any]]:
-    """Load ``module:callable`` and validate its indexed storage instances."""
-    module_name, separator, attribute_name = specification.partition(":")
-    if not separator or not module_name or not attribute_name:
-        raise ValueError("Registry must use module:callable syntax")
-    registry = getattr(importlib.import_module(module_name), attribute_name)
+def load_index_registry(name: str) -> list[IndexedJsonFileStorage[Any]]:
+    """Load and validate an installed ``mx8fs.index_registries`` entry point."""
+    matches = [entry for entry in entry_points(group=_INDEX_REGISTRY_GROUP) if entry.name == name]
+    if not matches:
+        raise ValueError(f"No installed {_INDEX_REGISTRY_GROUP} entry point named {name!r}")
+    if len(matches) > 1:
+        raise ValueError(f"Multiple installed {_INDEX_REGISTRY_GROUP} entry points are named {name!r}")
+    registry = matches[0].load()
     if not callable(registry):
-        raise TypeError(f"Registry {specification} is not callable")
+        raise TypeError(f"Registry {name!r} is not callable")
     targets = list(registry())
     if any(not isinstance(target, IndexedJsonFileStorage) for target in targets):
         raise TypeError("Registry must return only IndexedJsonFileStorage instances")

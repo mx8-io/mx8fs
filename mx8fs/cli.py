@@ -24,11 +24,11 @@ def _parser() -> argparse.ArgumentParser:
 
     discover = subcommands.add_parser("discover-indexes", help="advisory scan for indexed storage declarations")
     discover.add_argument("root")
-    discover.add_argument("--registry", help="optional module:callable registry to compare")
+    discover.add_argument("--registry", help="optional installed mx8fs registry entry point to compare")
     discover.add_argument("--json", action="store_true", dest="json_output")
 
     migrate = subcommands.add_parser("migrate-indexes", help="migrate registered indexed storage namespaces")
-    migrate.add_argument("registry", help="module:callable returning configured indexed storage instances")
+    migrate.add_argument("registry", help="installed mx8fs registry entry point")
     migrate.add_argument("--jobs", type=_positive_integer, default=4)
     migrate.add_argument("--total-read-workers", type=_positive_integer, default=100)
     migrate.add_argument("--dry-run", action="store_true")

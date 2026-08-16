@@ -64,6 +64,11 @@ def test_read(file_storage: JsonFileStorage) -> None:
     assert content == StorageTestClass(value="content1", key="file1")
 
 
+def test_read_many_rejects_non_positive_workers(file_storage: JsonFileStorage) -> None:
+    with pytest.raises(ValueError, match="max_workers must be positive"):
+        file_storage.read_many([], max_workers=0)
+
+
 def test_read_and_update_with_version(file_storage: JsonFileStorage) -> None:
     file_storage.write(StorageTestClass(value="content1"), "file1")
     current, version = file_storage.read_with_version("file1")

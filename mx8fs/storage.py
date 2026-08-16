@@ -54,9 +54,11 @@ def _parallel_map[InputT, OutputT](
     on_result: Callable[[], None] | None = None,
 ) -> builtins.list[OutputT]:
     """Apply a function concurrently with bounded submissions while preserving order."""
+    workers = max_workers if max_workers is not None else min(32, (os.cpu_count() or 1) + 4)
+    if workers <= 0:
+        raise ValueError("max_workers must be positive")
     if not items:
         return []
-    workers = max_workers or min(32, (os.cpu_count() or 1) + 4)
     max_pending = max(workers, min(_PARALLEL_PREFETCH_LIMIT, workers * 10))
     results: dict[int, OutputT] = {}
     indexed_items = iter(enumerate(items))
