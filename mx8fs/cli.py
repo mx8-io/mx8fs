@@ -40,7 +40,7 @@ def _run_discovery(arguments: argparse.Namespace) -> int:
     discoveries = discover_indexed_storage(arguments.root)
     registered_types: set[str] = set()
     if arguments.registry:
-        registered_types = {type(storage).__name__ for storage in load_index_registry(arguments.registry)}
+        registered_types = set(load_index_registry(arguments.registry))
     rows = [
         {
             **asdict(discovery),
@@ -64,7 +64,7 @@ def _run_discovery(arguments: argparse.Namespace) -> int:
 def _run_migration(arguments: argparse.Namespace) -> int:
     storages = load_index_registry(arguments.registry)
     report = migrate_indexes(
-        storages,
+        storages.values(),
         jobs=arguments.jobs,
         total_read_workers=arguments.total_read_workers,
         dry_run=arguments.dry_run,

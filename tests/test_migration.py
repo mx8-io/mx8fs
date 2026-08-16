@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+import threading
 import types
 from pathlib import Path
+from time import sleep
 from typing import Any
 
 import pytest
@@ -49,23 +51,26 @@ def make_storages(
 def test_registry_loading_and_validation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     storage = make_storages(tmp_path, monkeypatch, count=1)[0]
     entries = [
-        types.SimpleNamespace(name="targets", load=lambda: lambda: [storage]),
+        types.SimpleNamespace(name="targets", load=lambda: lambda: {"MigrationStorage": storage}),
         types.SimpleNamespace(name="not-callable", load=lambda: []),
-        types.SimpleNamespace(name="bad-targets", load=lambda: lambda: [object()]),
-        types.SimpleNamespace(name="duplicate", load=lambda: lambda: []),
-        types.SimpleNamespace(name="duplicate", load=lambda: lambda: []),
+        types.SimpleNamespace(name="not-mapping", load=lambda: lambda: [storage]),
+        types.SimpleNamespace(name="bad-symbol", load=lambda: lambda: {1: storage}),
+        types.SimpleNamespace(name="bad-target", load=lambda: lambda: {"MigrationStorage": object()}),
+        types.SimpleNamespace(name="duplicate", load=lambda: lambda: {}),
+        types.SimpleNamespace(name="duplicate", load=lambda: lambda: {}),
     ]
     monkeypatch.setattr(migration_module, "entry_points", lambda **_: entries)
 
-    assert load_index_registry("targets") == [storage]
+    assert load_index_registry("targets") == {"MigrationStorage": storage}
     with pytest.raises(ValueError, match="No installed"):
         load_index_registry("missing")
     with pytest.raises(ValueError, match="Multiple installed"):
         load_index_registry("duplicate")
     with pytest.raises(TypeError, match="not callable"):
         load_index_registry("not-callable")
-    with pytest.raises(TypeError, match="only Indexed"):
-        load_index_registry("bad-targets")
+    for name in ["not-mapping", "bad-symbol", "bad-target"]:
+        with pytest.raises(TypeError, match="mapping of source symbols"):
+            load_index_registry(name)
 
 
 def test_migrate_indexes_groups_schemas_deduplicates_and_budgets_workers(
@@ -93,6 +98,34 @@ def test_migrate_indexes_groups_schemas_deduplicates_and_budgets_workers(
     assert not report.failures
     assert schema_calls == [first.base_path]
     assert rebuild_workers == {first.base_path: 5, second.base_path: 5}
+
+
+def test_migrate_indexes_limits_active_jobs_to_total_read_workers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    storages = make_storages(tmp_path, monkeypatch, count=3)
+    active = 0
+    maximum_active = 0
+    lock = threading.Lock()
+
+    for storage in storages:
+        monkeypatch.setattr(storage, "migrate_schema", lambda: None)
+
+        def rebuild(max_workers: int | None = None) -> IndexRebuildResult:
+            nonlocal active, maximum_active
+            assert max_workers == 1
+            with lock:
+                active += 1
+                maximum_active = max(maximum_active, active)
+            sleep(0.01)
+            with lock:
+                active -= 1
+            return IndexRebuildResult(upserted=1, removed=0)
+
+        monkeypatch.setattr(storage, "rebuild_index", rebuild)
+
+    assert migrate_indexes(storages, jobs=8, total_read_workers=2).succeeded
+    assert maximum_active == 2
 
 
 def test_migrate_indexes_reports_schema_and_namespace_failures(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -176,21 +209,21 @@ def test_cli_discovery_and_migration_output(
     )
     monkeypatch.setattr(cli_module, "discover_indexed_storage", lambda _: discovery)
     registered = type("Jobs", (), {})()
-    monkeypatch.setattr(cli_module, "load_index_registry", lambda _: [registered])
+    monkeypatch.setattr(cli_module, "load_index_registry", lambda _: {"Jobs": registered})
     monkeypatch.setattr(cli_module, "migrate_indexes", lambda *_, **__: report)
 
     assert cli_module.main(["discover-indexes", str(tmp_path)]) == 0
     assert "app.py:4 Jobs" in capsys.readouterr().out
     assert cli_module.main(["discover-indexes", str(tmp_path), "--registry", "application"]) == 0
     assert "Jobs registered" in capsys.readouterr().out
-    monkeypatch.setattr(cli_module, "load_index_registry", lambda _: [])
+    monkeypatch.setattr(cli_module, "load_index_registry", lambda _: {})
     assert cli_module.main(["discover-indexes", str(tmp_path), "--registry", "application"]) == 0
     assert "Jobs unregistered" in capsys.readouterr().out
     assert cli_module.main(["discover-indexes", str(tmp_path), "--registry", "application", "--json"]) == 0
     assert json.loads(capsys.readouterr().out)[0]["registered"] is False
-    assert cli_module.main(["migrate-indexes", "app:targets"]) == 0
+    assert cli_module.main(["migrate-indexes", "application"]) == 0
     assert "Migrated Jobs /jobs" in capsys.readouterr().out
-    assert cli_module.main(["migrate-indexes", "app:targets", "--json"]) == 0
+    assert cli_module.main(["migrate-indexes", "application", "--json"]) == 0
     assert json.loads(capsys.readouterr().out)["results"][0]["upserted"] == 2
 
 
@@ -201,7 +234,7 @@ def test_cli_failures_dry_run_and_input_errors(
     failure = IndexMigrationFailure(target, "schema", "broken")
     failed_report = IndexMigrationReport((target,), (), (failure,), False)
     dry_report = IndexMigrationReport((target,), (), (), True)
-    monkeypatch.setattr(cli_module, "load_index_registry", lambda _: [])
+    monkeypatch.setattr(cli_module, "load_index_registry", lambda _: {})
     monkeypatch.setattr(cli_module, "migrate_indexes", lambda *_, **__: failed_report)
 
     assert cli_module.main(["migrate-indexes", "app:targets"]) == 1

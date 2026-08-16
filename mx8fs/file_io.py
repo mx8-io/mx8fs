@@ -156,7 +156,7 @@ def write_file(file: str, data: str) -> str:
         response = s3_client.put_object(Bucket=bucket, Key=key, Body=data.encode("UTF-8"))
         return str(response["ETag"]).strip('"')
     else:
-        os.makedirs(os.path.dirname(file), exist_ok=True)
+        os.makedirs(os.path.dirname(file) or ".", exist_ok=True)
         with open(file, mode="w", encoding="UTF-8") as file_io:
             file_io.write(data)
         return str(os.stat(file).st_mtime_ns)
