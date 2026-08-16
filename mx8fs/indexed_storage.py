@@ -6,57 +6,34 @@ import logging
 import os
 import threading
 from collections.abc import Callable
-from datetime import datetime
 from typing import Any, cast
 
 from pydantic import ValidationError
 from sqlalchemy import create_engine, event
 from sqlalchemy.engine import Engine
-from sqlalchemy.exc import DatabaseError
 
-from .file_io import file_exists
+from .file_io import (
+    _get_file_version,
+    _list_file_versions,
+    read_file_with_version,
+)
 from .index import (
     IndexManager,
     IndexRebuildResult,
+    IndexSchemaError,
     IndexUpdateError,
     JsonIndex,
-    MissingIndexError,
     StorageQuery,
     namespace_for,
 )
-from .lock import FileLock
-from .storage import JsonFileStorage
+from .storage import _MAX_VERSION_ATTEMPTS, JsonFileStorage, _parallel_map
 
 logger = logging.getLogger("mx8.storage")
 
+_DEFAULT_REBUILD_WORKERS = 100
 _index_engines: dict[tuple[str, ...], tuple[Engine, str | None]] = {}
 _index_engines_lock = threading.Lock()
 _index_engine_locks: dict[tuple[str, ...], threading.Lock] = {}
-
-
-class _ReentrantFileLock(FileLock):
-    """Reuse a storage lock already held by this thread and storage instance."""
-
-    def __init__(self, storage: IndexedJsonFileStorage[Any], *args: Any, **kwargs: Any) -> None:
-        super().__init__(*args, **kwargs)
-        self._storage = storage
-        self._owns_file_lock = False
-
-    def __enter__(self) -> _ReentrantFileLock:
-        counts = self._storage._lock_counts()
-        if counts.get(self.file, 0) == 0:
-            super().__enter__()
-            self._owns_file_lock = True
-        counts[self.file] = counts.get(self.file, 0) + 1
-        return self
-
-    def __exit__(self, *args: Any, **kwargs: Any) -> None:
-        counts = self._storage._lock_counts()
-        counts[self.file] -= 1
-        if counts[self.file] == 0:
-            del counts[self.file]
-            if self._owns_file_lock:  # pragma: no branch - false owners exit before the outer lock
-                super().__exit__(*args, **kwargs)
 
 
 def _index_engine_key(base_path: str) -> tuple[str, ...]:
@@ -90,6 +67,7 @@ def _new_index_engine(key: tuple[str, ...]) -> tuple[Engine, str | None]:
                 dbname=key[4],
                 driver="psycopg",
                 sslrootcert=get_cert_path(True),
+                pool_pre_ping=True,
             ),
             None,
         )
@@ -132,168 +110,218 @@ def _create_index_engine(base_path: str) -> tuple[Engine, str | None]:
         return current
 
 
-def _replace_corrupt_index_engine(
-    base_path: str,
-    failed_engine: Engine,
-    database_path: str,
-) -> tuple[Engine, str | None]:
-    """Replace a corrupt cached SQLite engine once for this process."""
-    key = _index_engine_key(base_path)
-    with _index_engine_lock(key):
-        with _index_engines_lock:
-            current = _index_engines.get(key)
-        if current is not None and current[0] is not failed_engine:
-            return current
-        failed_engine.dispose()
-        with FileLock(database_path):
-            if os.path.exists(database_path):
-                timestamp = datetime.now().strftime("%Y%m%d%H%M%S%f")
-                os.replace(database_path, f"{database_path}.invalid-{timestamp}")
-        replacement = _new_index_engine(key)
-        with _index_engines_lock:
-            _index_engines[key] = replacement
-        return replacement
-
-
-def _is_corrupt_sqlite(error: DatabaseError) -> bool:
-    message = str(error).lower()
-    return "file is not a database" in message or "database disk image is malformed" in message
-
-
 class IndexedJsonFileStorage[ModelT](JsonFileStorage[ModelT]):
-    """JSON storage with a self-healing SQL secondary index."""
+    """JSON storage with an explicitly migrated SQL secondary index."""
 
     _index_definition: JsonIndex[Any]
 
     def __init__(self, base_path: str, randomizer: Callable[[], None] | None = None) -> None:
-        """Initialize file storage and ensure its SQL index is ready."""
+        """Initialize file storage without migrating an existing SQL index."""
         super().__init__(base_path, randomizer)
         self.index = cast(JsonIndex[ModelT], self._index_definition)
         self._namespace = namespace_for(base_path)
-        self._held_locks = threading.local()
         self._index_manager = self._create_manager()
-        self._ensure_index()
+        self._index_ready = False
 
     def _create_manager(self) -> IndexManager[ModelT]:
-        engine, database_path = _create_index_engine(self.base_path)
+        engine, _ = _create_index_engine(self.base_path)
+        return IndexManager(engine, self.index, self._namespace)
+
+    def _prepare_schema(self) -> None:
+        """Create a missing index or reject an incompatible existing one."""
+        self._index_manager.ensure_catalog()
+        self._index_manager.create_schema_if_missing()
         try:
-            return IndexManager(engine, self.index, self._namespace)
-        except DatabaseError as error:
-            if database_path is None or not _is_corrupt_sqlite(error):
-                raise
-            logger.exception("Local JSON index database is corrupt; preserving and recreating it")
-            replacement, _ = _replace_corrupt_index_engine(self.base_path, engine, database_path)
-            return IndexManager(replacement, self.index, self._namespace)
-
-    def _lock_counts(self) -> dict[str, int]:
-        counts = getattr(self._held_locks, "counts", None)
-        if counts is None:
-            counts = {}
-            self._held_locks.counts = counts
-        return cast(dict[str, int], counts)
-
-    def get_lock(
-        self,
-        key: str,
-        wait_period: float = 0.1,
-        time_out_seconds: int = 840,
-        maximum_age: int = 900,
-    ) -> FileLock:
-        """Get a re-entrant file lock for an indexed stored model."""
-        return _ReentrantFileLock(
-            self,
-            self._get_path(key),
-            wait_period=wait_period,
-            time_out_seconds=time_out_seconds,
-            maximum_age=maximum_age,
-        )
+            self._index_manager.validate_schema()
+        except IndexSchemaError as error:
+            raise type(error)(f"{error}. Run migrate_index() during deployment") from error
 
     def _ensure_index(self) -> None:
-        self._index_manager.ensure_schema()
-        if self._index_manager.namespace_ready():
+        if self._index_ready:
             return
-        try:
-            raise MissingIndexError(f"Index namespace {self._namespace} has not been reconciled")
-        except MissingIndexError:
-            logger.exception("JSON index namespace is missing; rebuilding")
+        self._prepare_schema()
+        if self._index_manager.namespace_ready():
+            self._index_ready = True
+            return
+        logger.info("Creating JSON index namespace %s", self._namespace)
         with self._index_manager.lease(f"namespace:{self.index.table_name}:{self._namespace}") as lease:
-            self._index_manager.ensure_schema()
+            self._prepare_schema()
             if not self._index_manager.namespace_ready():
                 self._reconcile_index(lease)
                 self._index_manager.mark_namespace_ready()
+        self._index_ready = True
 
-    def _reconcile_existing_file(self, key: str, was_indexed: bool) -> IndexRebuildResult:
+    def _read_rebuild_key(self, key: str) -> tuple[str, dict[str, Any] | None, str | None]:
         try:
-            model = self.read(key)
+            contents, version = read_file_with_version(self._get_path(key))
+        except FileNotFoundError:
+            return key, None, None
+        try:
+            model = self._json_to_model(contents)
         except ValidationError as error:
             logger.error(
                 "Skipping malformed JSON object key %s during index reconciliation: %s",
                 key,
                 error,
             )
-            if was_indexed:
-                self._index_manager.delete(key)
-            return IndexRebuildResult(upserted=0, removed=int(was_indexed))
-        self._index_manager.upsert(model)
-        return IndexRebuildResult(upserted=1, removed=0)
+            return key, None, version
+        return key, self.index.values_for(model, self._namespace, version), version
 
-    def _reconcile_index(self, lease: Any) -> IndexRebuildResult:
-        current_keys = set(self.list())
-        indexed_keys = self._index_manager.indexed_keys()
-        upserted = 0
-        removed = 0
-        for key in sorted(current_keys):
-            with self.get_lock(key):
-                if file_exists(self._get_path(key)):
-                    result = self._reconcile_existing_file(key, key in indexed_keys)
-                    upserted += result.upserted
-                    removed += result.removed
+    def _reconcile_index(self, lease: Any, max_workers: int | None = None) -> IndexRebuildResult:
+        initial_indexed_keys = self._index_manager.indexed_keys()
+        workers = _DEFAULT_REBUILD_WORKERS if max_workers is None else max_workers
+        listed_versions = _list_file_versions(self.base_path, self._extension)
+        results = _parallel_map(
+            self._read_rebuild_key,
+            sorted(listed_versions),
+            workers,
+            lease.maybe_renew,
+        )
+        observed_versions = {key: version for key, _, version in results if version is not None}
+        projections = [projection for _, projection, _ in results if projection is not None]
+        indexed_keys = {cast(str, projection[self._key_field]) for projection in projections}
+        self._index_manager.replace_namespace(projections)
+        lease.maybe_renew()
+
+        for _ in range(_MAX_VERSION_ATTEMPTS):
+            current_versions = _list_file_versions(self.base_path, self._extension)
+            if current_versions == observed_versions:
+                return IndexRebuildResult(
+                    upserted=len(indexed_keys),
+                    removed=len(initial_indexed_keys - indexed_keys),
+                )
+            changed_keys = sorted(
+                key for key, version in current_versions.items() if observed_versions.get(key) != version
+            )
+            removed_source_keys = set(observed_versions) - set(current_versions)
+            delete_index_keys = set(removed_source_keys)
+            changed_results = _parallel_map(
+                self._read_rebuild_key,
+                changed_keys,
+                workers,
+                lease.maybe_renew,
+            )
+            changed_projections: list[dict[str, Any]] = []
+            for key, projection, version in changed_results:
+                if version is None:
+                    observed_versions.pop(key, None)
+                    delete_index_keys.add(key)
                 else:
-                    self._index_manager.delete(key)
-            lease.maybe_renew()
-
-        for key in sorted(indexed_keys - current_keys):
-            with self.get_lock(key):
-                if file_exists(self._get_path(key)):
-                    result = self._reconcile_existing_file(key, True)
-                    upserted += result.upserted
-                    removed += result.removed
+                    observed_versions[key] = version
+                if projection is None:
+                    delete_index_keys.add(key)
+                    indexed_keys.discard(key)
                 else:
-                    self._index_manager.delete(key)
-                    removed += 1
+                    changed_projections.append(projection)
+                    indexed_keys.add(cast(str, projection[self._key_field]))
+            for key in removed_source_keys:
+                observed_versions.pop(key, None)
+                indexed_keys.discard(key)
+            self._index_manager.delete_many(sorted(delete_index_keys))
+            self._index_manager.upsert_projections(changed_projections)
             lease.maybe_renew()
-        return IndexRebuildResult(upserted=upserted, removed=removed)
+        raise IndexUpdateError(f"JSON changed repeatedly while rebuilding index namespace {self._namespace}")
 
-    def rebuild_index(self) -> IndexRebuildResult:
+    def rebuild_index(self, max_workers: int | None = None) -> IndexRebuildResult:
         """Fully reconcile this JSON namespace with its SQL index."""
-        self._index_manager.ensure_schema()
+        self._prepare_schema()
         with self._index_manager.lease(f"namespace:{self.index.table_name}:{self._namespace}") as lease:
-            result = self._reconcile_index(lease)
+            result = self._reconcile_index(lease, max_workers)
             self._index_manager.mark_namespace_ready()
+            self._index_ready = True
             return result
+
+    def migrate_index(self, max_workers: int | None = None) -> IndexRebuildResult:
+        """Explicitly migrate the SQL index schema and rebuild this namespace."""
+        self.migrate_schema()
+        with self._index_manager.lease(f"namespace:{self.index.table_name}:{self._namespace}") as lease:
+            result = self._reconcile_index(lease, max_workers)
+            self._index_manager.mark_namespace_ready()
+        self._index_ready = True
+        return result
+
+    def migrate_schema(self) -> None:
+        """Explicitly migrate this storage's physical index schema."""
+        self._index_ready = False
+        self._index_manager.migrate_schema()
 
     def query(self) -> StorageQuery[ModelT]:
         """Create a scoped SQLAlchemy index query."""
         return StorageQuery(self)
 
     def update(self, content: ModelT) -> ModelT:
-        """Write canonical JSON and synchronize its index under one key lock."""
+        """Write canonical JSON and stabilize its index without file locking."""
         self._ensure_index()
         key = cast(str, getattr(content, self._key_field))
-        with self.get_lock(key):
-            result = super().update(content)
+        version = self._write_with_version(content)
+        try:
+            self._synchronize_written(key, content, version)
+        except Exception as error:
+            raise IndexUpdateError(f"JSON was updated but index synchronization failed for key {key}") from error
+        return content
+
+    def mutate(
+        self,
+        key: str,
+        mutation: Callable[[ModelT], ModelT],
+        max_attempts: int = _MAX_VERSION_ATTEMPTS,
+    ) -> ModelT:
+        """Mutate canonical JSON and stabilize its index."""
+        self._ensure_index()
+        updated, version = self._mutate_with_version(key, mutation, max_attempts)
+        try:
+            self._synchronize_written(key, updated, version)
+        except Exception as error:
+            raise IndexUpdateError(f"JSON was updated but index synchronization failed for key {key}") from error
+        return updated
+
+    def update_if_version(self, content: ModelT, version: str) -> ModelT:
+        """Update canonical JSON only when its current version matches."""
+        self._ensure_index()
+        key = cast(str, getattr(content, self._key_field))
+        written_version = self._update_if_version(content, version)
+        try:
+            self._synchronize_written(key, content, written_version)
+        except Exception as error:
+            raise IndexUpdateError(f"JSON was updated but index synchronization failed for key {key}") from error
+        return content
+
+    def _synchronize_written(self, key: str, model: ModelT, version: str) -> None:
+        """Index a known write and reread only when a concurrent change occurred."""
+        self._index_manager.upsert(model, version)
+        try:
+            if _get_file_version(self._get_path(key)) == version:
+                return
+        except FileNotFoundError:
+            pass
+        self._synchronize_key(key)
+
+    def _synchronize_key(self, key: str) -> None:
+        path = self._get_path(key)
+        for _ in range(_MAX_VERSION_ATTEMPTS):
             try:
-                self._index_manager.upsert(result)
-            except Exception as error:
-                raise IndexUpdateError(f"JSON was updated but index synchronization failed for key {key}") from error
-            return result
+                model, version = self.read_with_version(key)
+            except FileNotFoundError:
+                self._index_manager.delete(key)
+                try:
+                    _get_file_version(path)
+                except FileNotFoundError:
+                    return
+                continue
+            self._index_manager.upsert(model, version)
+            try:
+                current_version = _get_file_version(path)
+            except FileNotFoundError:
+                continue
+            if current_version == version:
+                return
+        raise IndexUpdateError(f"JSON changed repeatedly while synchronizing index key {key}")
 
     def delete(self, key: str) -> None:
-        """Delete canonical JSON and synchronize its index under one key lock."""
+        """Delete canonical JSON and stabilize its index without file locking."""
         self._ensure_index()
-        with self.get_lock(key):
-            super().delete(key)
-            try:
-                self._index_manager.delete(key)
-            except Exception as error:
-                raise IndexUpdateError(f"JSON was deleted but index synchronization failed for key {key}") from error
+        super().delete(key)
+        try:
+            self._synchronize_key(key)
+        except Exception as error:
+            raise IndexUpdateError(f"JSON was deleted but index synchronization failed for key {key}") from error

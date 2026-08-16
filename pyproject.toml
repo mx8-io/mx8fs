@@ -19,6 +19,9 @@ psycopg-pool = {version = ">=3.2", optional = true}
 json-storage = ["pydantic"]
 indexed-json-storage = ["pydantic", "sqlalchemy", "aurora-dsql-sqlalchemy", "psycopg-pool"]
 
+[tool.poetry.scripts]
+mx8fs = "mx8fs.cli:main"
+
 [tool.poetry.group.dev.dependencies]
 coverage = ">=7.4.4"
 pytest-cov = ">=5.0.0"
