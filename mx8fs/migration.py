@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import ast
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from importlib.metadata import entry_points
@@ -82,7 +82,7 @@ class DiscoveredIndex:
     symbol: str | None
 
 
-def load_index_registry(name: str) -> list[IndexedJsonFileStorage[Any]]:
+def load_index_registry(name: str) -> dict[str, IndexedJsonFileStorage[Any]]:
     """Load and validate an installed ``mx8fs.index_registries`` entry point."""
     matches = [entry for entry in entry_points(group=_INDEX_REGISTRY_GROUP) if entry.name == name]
     if not matches:
@@ -92,10 +92,13 @@ def load_index_registry(name: str) -> list[IndexedJsonFileStorage[Any]]:
     registry = matches[0].load()
     if not callable(registry):
         raise TypeError(f"Registry {name!r} is not callable")
-    targets = list(registry())
-    if any(not isinstance(target, IndexedJsonFileStorage) for target in targets):
-        raise TypeError("Registry must return only IndexedJsonFileStorage instances")
-    return targets
+    targets = registry()
+    if not isinstance(targets, Mapping) or any(
+        not isinstance(symbol, str) or not isinstance(target, IndexedJsonFileStorage)
+        for symbol, target in targets.items()
+    ):
+        raise TypeError("Registry must return a mapping of source symbols to IndexedJsonFileStorage instances")
+    return dict(targets)
 
 
 def _target(storage: IndexedJsonFileStorage[Any]) -> IndexMigrationTarget:
@@ -150,7 +153,7 @@ def _rebuild_namespaces(
 ) -> tuple[list[IndexMigrationResult], list[IndexMigrationFailure]]:
     if not storages:
         return [], []
-    active_jobs = min(jobs, len(storages))
+    active_jobs = min(jobs, len(storages), total_read_workers)
     read_workers = max(1, total_read_workers // active_jobs)
 
     def rebuild(storage: IndexedJsonFileStorage[Any]) -> tuple[IndexRebuildResult, float]:

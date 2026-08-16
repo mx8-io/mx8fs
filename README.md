@@ -360,10 +360,10 @@ Runtime storage paths may come from environment variables, dependency injection,
 ```python
 # app/mx8fs_migrations.py
 def indexed_storages():
-    return [
-        JobStorage(settings.jobs_path),
-        UserStorage(settings.users_path),
-    ]
+    return {
+        "JobStorage": JobStorage(settings.jobs_path),
+        "UserStorage": UserStorage(settings.users_path),
+    }
 ```
 
 Expose that callable as an installed package entry point so only registries explicitly declared by the application can be loaded:
@@ -373,7 +373,7 @@ Expose that callable as an installed package entry point so only registries expl
 application = "app.mx8fs_migrations:indexed_storages"
 ```
 
-Poetry applications can declare the same mapping under `[tool.poetry.plugins."mx8fs.index_registries"]`.
+Registry keys must match the assigned storage symbols reported by `discover-indexes`. Poetry applications can declare the same entry-point mapping under `[tool.poetry.plugins."mx8fs.index_registries"]`.
 
 Install the indexed storage extra and run one deployment migration job before starting application replicas:
 

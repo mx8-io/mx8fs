@@ -686,6 +686,14 @@ def test_update_file(tmp_path: Path) -> None:
         delete_file(test_file)
 
 
+def test_write_file_accepts_bare_relative_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.chdir(tmp_path)
+
+    version = write_file("relative.txt", "contents")
+
+    assert read_file_with_version("relative.txt") == ("contents", version)
+
+
 def test_purge_folder_local(tmp_path: Path) -> None:
     root = str(tmp_path)
     # Create nested directories
