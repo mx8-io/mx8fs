@@ -349,7 +349,7 @@ Indexed S3 storage requires `MX8FS_DSQL_ENDPOINT`. `MX8FS_DSQL_USER` defaults to
 
 Aurora DSQL engines intentionally use SQLAlchemy `pool_pre_ping=True`. AWS Lambda execution environments can retain pooled database connections while frozen, after which the remote TLS session may have closed. Pre-ping invalidates that stale connection before application SQL executes. Do not disable it merely to remove a checkout round trip.
 
-`rebuild_index()` can be called to force a full reconciliation. Rebuilds read canonical objects concurrently with up to 100 workers by default, retain primitive SQL projections rather than full Pydantic models, replace the namespace index in bounded insert batches, and verify that source versions remained stable. If objects change during the rebuild, only changed, new, or deleted keys are repaired in bounded delta passes. Pass `max_workers` to tune read concurrency.
+`rebuild_index()` can be called to force a full reconciliation. Rebuilds read canonical objects concurrently with up to 100 workers by default, retain primitive SQL projections rather than full Pydantic models, reconcile the namespace index in bounded write transactions, and verify that source versions remained stable. If objects change during the rebuild, only changed, new, or deleted keys are repaired in bounded delta passes. Pass `max_workers` to tune read concurrency.
 
 Indexed writes use the ETag or local version returned by the canonical write to update the index without rereading uncontended JSON. The canonical version is checked afterward; a GET and another index synchronization happen only when another writer changed the object concurrently.
 

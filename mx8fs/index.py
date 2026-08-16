@@ -59,6 +59,7 @@ SOURCE_VERSION_COLUMN = "_mx8fs_source_version"
 CATALOG_DEFINITIONS = "_mx8fs_index_definitions"
 CATALOG_NAMESPACES = "_mx8fs_index_namespaces"
 CATALOG_LEASES = "_mx8fs_index_leases"
+DEFAULT_WRITE_BATCH_SIZE = 100
 
 _catalog_initialized: weakref.WeakSet[Engine] = weakref.WeakSet()
 _catalog_initialized_lock = threading.Lock()
@@ -563,46 +564,62 @@ class IndexManager[ModelT]:
             set_=updated,
         )
 
-    def _execute_upserts(self, connection: Any, projections: Sequence[dict[str, Any]], batch_size: int) -> None:
+    def _execute_upserts(self, connection: Any, projections: Sequence[dict[str, Any]]) -> None:
         statement = self._upsert_statement()
+        connection.execute(statement, projections)
+
+    def _upsert_projections_batched(
+        self,
+        projections: Sequence[dict[str, Any]],
+        batch_size: int,
+    ) -> None:
         for start in range(0, len(projections), batch_size):
-            connection.execute(statement, projections[start : start + batch_size])
+            with self.engine.begin() as connection:
+                self._execute_upserts(connection, projections[start : start + batch_size])
 
     def upsert_projection(self, projection: dict[str, Any]) -> None:
         """Insert or update one precomputed index projection."""
         self.upsert_projections([projection], batch_size=1)
 
-    def upsert_projections(self, projections: Sequence[dict[str, Any]], batch_size: int = 1000) -> None:
+    def upsert_projections(
+        self,
+        projections: Sequence[dict[str, Any]],
+        batch_size: int = DEFAULT_WRITE_BATCH_SIZE,
+    ) -> None:
         """Insert or update precomputed projections in bounded batches."""
         if batch_size <= 0:
             raise ValueError("batch_size must be positive")
         if not projections:
             return
-        with self.engine.begin() as connection:
-            self._execute_upserts(connection, projections, batch_size)
+        self._upsert_projections_batched(projections, batch_size)
 
-    def replace_namespace(self, projections: Sequence[dict[str, Any]], batch_size: int = 1000) -> None:
+    def replace_namespace(
+        self,
+        projections: Sequence[dict[str, Any]],
+        batch_size: int = DEFAULT_WRITE_BATCH_SIZE,
+    ) -> None:
         """Replace one namespace with a versioned canonical snapshot."""
         if batch_size <= 0:
             raise ValueError("batch_size must be positive")
         values_by_key = {projection[self.index.key_field]: projection for projection in projections}
-        values = list(values_by_key.values())
-        with self.engine.begin() as connection:
-            connection.execute(delete(self.index.table).where(self.index.table.c[NAMESPACE_COLUMN] == self.namespace))
-            if values:
-                self._execute_upserts(connection, values, batch_size)
+        stale_keys = self.indexed_keys() - set(values_by_key)
+        self._upsert_projections_batched(list(values_by_key.values()), batch_size)
+        self.delete_many(sorted(stale_keys), batch_size=batch_size)
 
-    def delete_many(self, keys: Sequence[str]) -> None:
+    def delete_many(self, keys: Sequence[str], batch_size: int = DEFAULT_WRITE_BATCH_SIZE) -> None:
         """Delete several projected rows from this namespace."""
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive")
         if not keys:
             return
-        with self.engine.begin() as connection:
-            connection.execute(
-                delete(self.index.table).where(
-                    self.index.table.c[NAMESPACE_COLUMN] == self.namespace,
-                    self.index.table.c[self.index.key_field].in_(keys),
+        for start in range(0, len(keys), batch_size):
+            with self.engine.begin() as connection:
+                connection.execute(
+                    delete(self.index.table).where(
+                        self.index.table.c[NAMESPACE_COLUMN] == self.namespace,
+                        self.index.table.c[self.index.key_field].in_(keys[start : start + batch_size]),
+                    )
                 )
-            )
 
     def delete(self, key: str) -> None:
         """Delete one projected model row."""

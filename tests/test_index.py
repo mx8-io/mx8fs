@@ -13,7 +13,20 @@ from uuid import UUID, uuid4
 
 import pytest
 from pydantic import BaseModel, Field, ValidationError
-from sqlalchemy import BigInteger, Column, MetaData, String, Table, create_engine, delete, insert, inspect, text, update
+from sqlalchemy import (
+    BigInteger,
+    Column,
+    MetaData,
+    String,
+    Table,
+    create_engine,
+    delete,
+    event,
+    insert,
+    inspect,
+    text,
+    update,
+)
 from sqlalchemy.exc import DatabaseError
 
 import mx8fs
@@ -919,9 +932,9 @@ def test_rebuild_repairs_only_changed_projection_after_bulk_replace(
         replacements += 1
         real_replace(projections)
 
-    def upsert(projections: Any) -> None:
+    def upsert(projections: Any, **kwargs: Any) -> None:
         delta_keys.extend(item[storage._key_field] for item in projections)
-        real_upsert(projections)
+        real_upsert(projections, **kwargs)
 
     monkeypatch.setattr(indexed_storage_module, "_list_file_versions", lambda *_: next(listings))
     monkeypatch.setattr(storage, "_read_rebuild_key", read_projection)
@@ -1011,8 +1024,34 @@ def test_projection_batch_validation_and_empty_operations(tmp_path: Path) -> Non
         manager.upsert_projections([], batch_size=0)
     with pytest.raises(ValueError, match="batch_size"):
         manager.replace_namespace([], batch_size=0)
+    with pytest.raises(ValueError, match="batch_size"):
+        manager.delete_many([], batch_size=0)
     manager.upsert_projections([])
     manager.delete_many([])
+
+
+def test_namespace_replacement_commits_each_bounded_batch(tmp_path: Path) -> None:
+    storage = make_storage(tmp_path)
+    storage.migrate_schema()
+    manager = storage._index_manager
+    manager.upsert(record("stale", "done", 1), "stale-version")
+    projections = [
+        projection(storage, record(f"record-{number}", "pending", number), str(number)) for number in range(5)
+    ]
+    commits = 0
+
+    def count_commit(_: Any) -> None:
+        nonlocal commits
+        commits += 1
+
+    event.listen(manager.engine, "commit", count_commit)
+    try:
+        manager.replace_namespace(projections, batch_size=2)
+    finally:
+        event.remove(manager.engine, "commit", count_commit)
+
+    assert commits == 4
+    assert manager.indexed_keys() == {f"record-{number}" for number in range(5)}
 
 
 def test_create_manager_propagates_corrupt_database(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
