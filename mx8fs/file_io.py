@@ -20,6 +20,7 @@ TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR TH
 import gzip
 import os
 import stat
+import tempfile
 import urllib.error
 import urllib.request
 from collections.abc import Generator
@@ -37,7 +38,7 @@ from botocore.config import Config
 from urllib3 import HTTPResponse
 
 boto_config = Config(
-    max_pool_connections=int(os.getenv("BOTO_MAX_CONNECTIONS", 50)),
+    max_pool_connections=int(os.getenv("BOTO_MAX_CONNECTIONS", 100)),
     connect_timeout=float(os.getenv("BOTO_CONNECT_TIMEOUT", 5.0)),
     read_timeout=float(os.getenv("BOTO_READ_TIMEOUT", 840.0)),  # 1 minute less than the lambda timeout
     retries={
@@ -129,56 +130,79 @@ def read_file_with_version(file: str) -> tuple[str, str]:
             raise FileNotFoundError(f"File {file} not found") from exc
     else:
         with open(file, encoding="UTF-8") as file_io:
-            # Use the file's last modified time as a unique hash
-            return file_io.read(), str(os.path.getmtime(file))
+            return file_io.read(), str(os.fstat(file_io.fileno()).st_mtime_ns)
 
 
-def write_file(file: str, data: str) -> None:
-    """Write a file to S3 or local storage with UTF-8 encoding."""
+def _get_file_version(file: str) -> str:
+    """Return the current S3 ETag or local modification version."""
     if file.startswith(S3_PREFIX):
         bucket, key = get_bucket_key(file)
-        s3_client.put_object(Bucket=bucket, Key=key, Body=data.encode("UTF-8"))
+        try:
+            return str(s3_client.head_object(Bucket=bucket, Key=key)["ETag"]).strip('"')
+        except s3_client.exceptions.ClientError as exc:
+            if exc.response["Error"]["Code"] in {"404", "NoSuchKey", "NotFound"}:
+                raise FileNotFoundError(f"File {file} not found") from exc
+            raise
+    try:
+        return str(os.stat(file).st_mtime_ns)
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(f"File {file} not found") from exc
+
+
+def write_file(file: str, data: str) -> str:
+    """Write a file and return its S3 ETag or local modification version."""
+    if file.startswith(S3_PREFIX):
+        bucket, key = get_bucket_key(file)
+        response = s3_client.put_object(Bucket=bucket, Key=key, Body=data.encode("UTF-8"))
+        return str(response["ETag"]).strip('"')
     else:
         os.makedirs(os.path.dirname(file), exist_ok=True)
         with open(file, mode="w", encoding="UTF-8") as file_io:
             file_io.write(data)
+        return str(os.stat(file).st_mtime_ns)
 
 
-def update_file_if_version_matches(file: str, data: str, version: str) -> None:
+def update_file_if_version_matches(file: str, data: str, version: str) -> str:
     """
     Write a file to S3 or local storage with UTF-8 encoding if the version matches.
 
     For S3, the version identifier is the ETag of the file.
     For local storage, the version identifier is the last modified time of the file.
 
-    :param file: The file to write
-    :param data: The data to write
+    :param file: The file to write.
+    :param data: The data to write.
+    :return: The version written by the successful conditional update.
     """
     if file.startswith(S3_PREFIX):
         bucket, key = get_bucket_key(file)
         try:
-            s3_client.put_object(Bucket=bucket, Key=key, Body=data.encode("UTF-8"), IfMatch=version)
+            response = s3_client.put_object(Bucket=bucket, Key=key, Body=data.encode("UTF-8"), IfMatch=version)
+            return str(response["ETag"]).strip('"')
         except s3_client.exceptions.NoSuchKey as exc:
             raise FileNotFoundError("File does not exist") from exc
         except s3_client.exceptions.ClientError as exc:
             if exc.response["Error"]["Code"] in ["PreconditionFailed", "ConditionalRequestConflict"]:
-                raise VersionMismatchError(f"File with the etag {version} does not exist") from exc
+                raise VersionMismatchError(f"File version does not match {version}") from exc
             else:  # pragma: no cover
                 raise exc
     else:
-        if not os.path.exists(file):
-            raise FileNotFoundError(f"File {file} not found")
+        try:
+            current_version = str(os.stat(file).st_mtime_ns)
+        except FileNotFoundError as exc:
+            raise FileNotFoundError(f"File {file} not found") from exc
+        if current_version != version:
+            raise VersionMismatchError(f"File version does not match {version}")
 
-        # Lock the local file and compare the timestamp
-        from mx8fs import FileLock
-
-        with FileLock(file) as _:
-            file_mtime = os.path.getmtime(file)
-            if str(file_mtime) != version:
-                raise VersionMismatchError(f"File with the etag {version} does not exist")
-            else:
-                with open(file, mode="w", encoding="UTF-8") as file_io:
-                    file_io.write(data)
+        directory = os.path.dirname(file) or "."
+        descriptor, temporary_path = tempfile.mkstemp(dir=directory)
+        try:
+            with os.fdopen(descriptor, mode="w", encoding="UTF-8") as file_io:
+                file_io.write(data)
+            os.replace(temporary_path, file)
+        finally:
+            if os.path.exists(temporary_path):  # pragma: no cover - replace normally consumes it
+                os.remove(temporary_path)
+        return str(os.stat(file).st_mtime_ns)
 
 
 def delete_file(file: str) -> None:
@@ -483,6 +507,27 @@ def list_files(root_path: str, file_type: str, prefix: str = "") -> list[str]:
     if root_path.startswith(S3_PREFIX):
         return [f.removesuffix(f".{file_type}") for f in get_files(root_path, prefix) if f.endswith(f".{file_type}")]
     return [os.path.split(f)[1][: -len(file_type) - 1] for f in glob(os.path.join(root_path, f"{prefix}*.{file_type}"))]
+
+
+def _list_file_versions(root_path: str, file_type: str) -> dict[str, str]:
+    """Return storage keys mapped to their S3 ETag or local modification version."""
+    suffix = f".{file_type}"
+    if root_path.startswith(S3_PREFIX):
+        bucket, key = get_bucket_key(root_path)
+        key = key + "/" if key and not key.endswith("/") else key
+        paginator = s3_client.get_paginator("list_objects_v2")
+        versions: dict[str, str] = {}
+        for page in paginator.paginate(Bucket=bucket, Prefix=key, PaginationConfig={"PageSize": 10_000}):
+            for item in page.get("Contents", []):
+                relative = str(item["Key"]).removeprefix(key)
+                if relative.endswith(suffix):
+                    versions[relative.removesuffix(suffix)] = str(item["ETag"]).strip('"')
+        return versions
+
+    return {
+        os.path.basename(file).removesuffix(suffix): str(os.stat(file).st_mtime_ns)
+        for file in glob(os.path.join(root_path, f"*{suffix}"))
+    }
 
 
 def most_recent_timestamp(root_path: str, file_type: str) -> float:

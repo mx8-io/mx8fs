@@ -7,9 +7,11 @@ import json
 import logging
 import os
 import re
+import threading
 import time
 import types
 import uuid
+import weakref
 from collections.abc import Sequence
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
@@ -41,6 +43,8 @@ from sqlalchemy import (
     select,
     update,
 )
+from sqlalchemy.dialects.postgresql import insert as postgresql_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.engine import Engine, RowMapping
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.schema import CreateIndex, CreateTable, DropTable
@@ -48,12 +52,16 @@ from sqlalchemy.sql import ColumnElement, Select, visitors
 
 logger = logging.getLogger("mx8.index")
 
-INDEX_FORMAT_VERSION = 1
+INDEX_FORMAT_VERSION = 2
 MAX_IDENTIFIER_LENGTH = 63
 NAMESPACE_COLUMN = "_mx8fs_namespace"
+SOURCE_VERSION_COLUMN = "_mx8fs_source_version"
 CATALOG_DEFINITIONS = "_mx8fs_index_definitions"
 CATALOG_NAMESPACES = "_mx8fs_index_namespaces"
 CATALOG_LEASES = "_mx8fs_index_leases"
+
+_catalog_initialized: weakref.WeakSet[Engine] = weakref.WeakSet()
+_catalog_initialized_lock = threading.Lock()
 
 
 def _create_table(engine: Engine, table: Table) -> None:
@@ -178,8 +186,10 @@ def _validate_index_fields(model: type[BaseModel], fields: Sequence[str], key_fi
     unknown = [field for field in fields if field not in model.model_fields]
     if unknown:
         raise ValueError(f"Unknown indexed fields: {', '.join(unknown)}")
-    if NAMESPACE_COLUMN in fields or key_field == NAMESPACE_COLUMN:
-        raise ValueError(f"{NAMESPACE_COLUMN} is reserved by mx8fs")
+    reserved = {NAMESPACE_COLUMN, SOURCE_VERSION_COLUMN}
+    selected_reserved = reserved.intersection((*fields, key_field))
+    if selected_reserved:
+        raise ValueError(f"{', '.join(sorted(selected_reserved))} is reserved by mx8fs")
 
 
 class JsonIndex[ModelT]:
@@ -237,6 +247,7 @@ class JsonIndex[ModelT]:
         columns = [
             Column(NAMESPACE_COLUMN, String(64), primary_key=True),
             self._column(key_field, primary_key=True),
+            Column(SOURCE_VERSION_COLUMN, String(128), nullable=True),
         ]
         columns.extend(self._column(field) for field in self.fields if field != key_field)
         self.table = Table(self.table_name, self.metadata, *columns)
@@ -256,9 +267,12 @@ class JsonIndex[ModelT]:
             return cast(Column[Any], self.table.c[name])
         raise AttributeError(name)
 
-    def values_for(self, model: ModelT, namespace: str) -> dict[str, Any]:
+    def values_for(self, model: ModelT, namespace: str, source_version: str | None = None) -> dict[str, Any]:
         """Extract SQL-safe projected values from a Pydantic model."""
-        values: dict[str, Any] = {NAMESPACE_COLUMN: namespace}
+        values: dict[str, Any] = {
+            NAMESPACE_COLUMN: namespace,
+            SOURCE_VERSION_COLUMN: source_version,
+        }
         for field in (self.key_field, *self.fields):
             value = getattr(model, field)
             _, type_name, _, enum_type = self._field_types[field]
@@ -385,24 +399,47 @@ class IndexManager[ModelT]:
             Column("owner", String(36), nullable=False),
             Column("expires_at", Float, nullable=False),
         )
-        for table in catalog.sorted_tables:
-            _create_table(engine, table)
+        self._catalog_tables = tuple(catalog.sorted_tables)
+
+    def ensure_catalog(self) -> None:
+        """Create shared catalog tables once per process-local engine."""
+        with _catalog_initialized_lock:
+            if self.engine in _catalog_initialized:
+                return
+            for table in self._catalog_tables:
+                _create_table(self.engine, table)
+            _catalog_initialized.add(self.engine)
 
     def lease(self, name: str) -> _Lease:
         """Return a shared SQL-backed lease."""
+        self.ensure_catalog()
         return _Lease(self, name)
 
-    def ensure_schema(self) -> None:
-        """Validate and self-heal the physical table."""
+    def create_schema_if_missing(self) -> None:
+        """Create a physical index that does not yet exist."""
+        self.ensure_catalog()
+        if inspect(self.engine).has_table(self.index.table_name):
+            return
+        with self.lease(f"schema:{self.index.table_name}"):
+            if not inspect(self.engine).has_table(self.index.table_name):
+                self._recreate_schema()
+
+    def migrate_schema(self) -> None:
+        """Explicitly replace a missing or incompatible physical index."""
+        self.ensure_catalog()
         try:
             self._validate_schema()
         except (MissingIndexError, InvalidIndexError):
-            logger.exception("JSON index %s is missing or invalid; recreating", self.index.table_name)
+            logger.exception("Migrating missing or incompatible JSON index %s", self.index.table_name)
             with self.lease(f"schema:{self.index.table_name}"):
                 try:
                     self._validate_schema()
                 except (MissingIndexError, InvalidIndexError):
                     self._recreate_schema()
+
+    def validate_schema(self) -> None:
+        """Validate the existing physical index without changing it."""
+        self._validate_schema()
 
     def _validate_schema(self) -> None:
         inspector = inspect(self.engine)
@@ -508,27 +545,64 @@ class IndexManager[ModelT]:
                 )
             )
 
-    def upsert(self, model: ModelT) -> None:
+    def upsert(self, model: ModelT, source_version: str | None = None) -> None:
         """Insert or update one projected model row."""
-        values = self.index.values_for(model, self.namespace)
-        key = values[self.index.key_field]
+        self.upsert_projection(self.index.values_for(model, self.namespace, source_version))
+
+    def _upsert_statement(self) -> Any:
+        insert_factory = sqlite_insert if self.engine.dialect.name == "sqlite" else postgresql_insert
+        statement = insert_factory(self.index.table)
+        excluded = statement.excluded
+        updated = {
+            name: excluded[name]
+            for name in self.index.table.c.keys()
+            if name not in {NAMESPACE_COLUMN, self.index.key_field}
+        }
+        return statement.on_conflict_do_update(
+            index_elements=[NAMESPACE_COLUMN, self.index.key_field],
+            set_=updated,
+        )
+
+    def _execute_upserts(self, connection: Any, projections: Sequence[dict[str, Any]], batch_size: int) -> None:
+        statement = self._upsert_statement()
+        for start in range(0, len(projections), batch_size):
+            connection.execute(statement, projections[start : start + batch_size])
+
+    def upsert_projection(self, projection: dict[str, Any]) -> None:
+        """Insert or update one precomputed index projection."""
+        self.upsert_projections([projection], batch_size=1)
+
+    def upsert_projections(self, projections: Sequence[dict[str, Any]], batch_size: int = 1000) -> None:
+        """Insert or update precomputed projections in bounded batches."""
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive")
+        if not projections:
+            return
         with self.engine.begin() as connection:
-            result = connection.execute(
-                update(self.index.table)
-                .where(
+            self._execute_upserts(connection, projections, batch_size)
+
+    def replace_namespace(self, projections: Sequence[dict[str, Any]], batch_size: int = 1000) -> None:
+        """Replace one namespace with a versioned canonical snapshot."""
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive")
+        values_by_key = {projection[self.index.key_field]: projection for projection in projections}
+        values = list(values_by_key.values())
+        with self.engine.begin() as connection:
+            connection.execute(delete(self.index.table).where(self.index.table.c[NAMESPACE_COLUMN] == self.namespace))
+            if values:
+                self._execute_upserts(connection, values, batch_size)
+
+    def delete_many(self, keys: Sequence[str]) -> None:
+        """Delete several projected rows from this namespace."""
+        if not keys:
+            return
+        with self.engine.begin() as connection:
+            connection.execute(
+                delete(self.index.table).where(
                     self.index.table.c[NAMESPACE_COLUMN] == self.namespace,
-                    self.index.table.c[self.index.key_field] == key,
-                )
-                .values(
-                    **{
-                        name: value
-                        for name, value in values.items()
-                        if name not in {NAMESPACE_COLUMN, self.index.key_field}
-                    }
+                    self.index.table.c[self.index.key_field].in_(keys),
                 )
             )
-            if result.rowcount == 0:
-                connection.execute(insert(self.index.table).values(**values))
 
     def delete(self, key: str) -> None:
         """Delete one projected model row."""

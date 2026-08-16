@@ -27,6 +27,7 @@ from typing import Any
 
 import pytest
 import urllib3
+from botocore.exceptions import ClientError
 from botocore.stub import Stubber
 
 from mx8fs import (
@@ -46,7 +47,7 @@ from mx8fs import (
     update_file_if_version_matches,
     write_file,
 )
-from mx8fs.file_io import get_bucket_key, get_files, purge_folder, s3_client
+from mx8fs.file_io import _get_file_version, _list_file_versions, get_bucket_key, get_files, purge_folder, s3_client
 
 TEST_BUCKET_NAME = "mx8-test-bucket/mx8fs"
 
@@ -56,6 +57,8 @@ def _test_read_file(file: str) -> None:
     delete_file(file)
     with pytest.raises(FileNotFoundError):
         read_file(file)
+    with pytest.raises(FileNotFoundError):
+        _get_file_version(file)
 
 
 def _test_read_binary_file(file: str) -> None:
@@ -116,6 +119,12 @@ def _test_list_files(path: str) -> None:
 
     write_file(os.path.join(path, TEST_FILE_1), "test1")
     write_file(os.path.join(path, TEST_FILE_2), "test2")
+    ignored_file = os.path.join(path, "ignored.json")
+    write_file(ignored_file, "ignored")
+
+    versions = _list_file_versions(path, "txt")
+    assert set(versions) == {"test1", "test2"}
+    assert versions["test1"] == _get_file_version(os.path.join(path, TEST_FILE_1))
 
     for files in [sorted(list_files(path, "txt")), sorted(list_files(path, "txt", "test"))]:
         assert len(files) == 2
@@ -131,6 +140,7 @@ def _test_list_files(path: str) -> None:
     # Delete the files
     delete_file(os.path.join(path, TEST_FILE_1))
     delete_file(os.path.join(path, TEST_FILE_2))
+    delete_file(ignored_file)
 
     # Delete the file again with no error
     delete_file(os.path.join(path, TEST_FILE_2))
@@ -207,6 +217,18 @@ def test_s3() -> None:
     _test_list_files(f"s3://{TEST_BUCKET_NAME}/test_path/")
 
     _test_most_recent_timestamp(f"s3://{TEST_BUCKET_NAME}/test_path/")
+
+
+def test_s3_version_lookup_propagates_unexpected_errors(monkeypatch: pytest.MonkeyPatch) -> None:
+    error = ClientError({"Error": {"Code": "AccessDenied", "Message": "denied"}}, "HeadObject")
+
+    def access_denied(**_: Any) -> None:
+        raise error
+
+    monkeypatch.setattr(s3_client, "head_object", access_denied)
+
+    with pytest.raises(ClientError, match="AccessDenied"):
+        _get_file_version("s3://bucket/key")
 
 
 def test_s3_public_url_get_then_put() -> None:
@@ -646,10 +668,11 @@ def test_update_file(tmp_path: Path) -> None:
         write_file(test_file, "test")
         contents, version = read_file_with_version(test_file)
         assert contents == "test"
-        update_file_if_version_matches(test_file, "test 2", version)
+        written_version = update_file_if_version_matches(test_file, "test 2", version)
         assert read_file(test_file) == "test 2"
         contents, version_2 = read_file_with_version(test_file)
         assert contents == "test 2"
+        assert written_version == version_2
         assert version_2 != version
 
         # Write and check we cannot overwrite the file

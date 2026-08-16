@@ -38,7 +38,7 @@ Below are the functions and classes exported by the library (`mx8fs.__all__`). P
   content, version = read_file_with_version('s3://my-bucket/app/config.json')
   ```
 
-- `write_file(path: str, data: str) -> None`: Write UTF‑8 text to S3 or local. Creates parent directories for local writes.
+- `write_file(path: str, data: str) -> str`: Write UTF‑8 text to S3 or local and return its resulting version. Creates parent directories for local writes.
 
   Example:
   ```python
@@ -48,9 +48,9 @@ Below are the functions and classes exported by the library (`mx8fs.__all__`). P
   write_file('s3://my-bucket/logs/run.txt', 'done')
   ```
 
-- `update_file_if_version_matches(path: str, data: str, version: str) -> None`: Conditional write.
+- `update_file_if_version_matches(path: str, data: str, version: str) -> str`: Version-aware write that returns the resulting version.
   - S3: uses `IfMatch=<etag>`. Raises `VersionMismatchError` on mismatch, `FileNotFoundError` if key missing.
-  - Local: acquires a `FileLock`, compares mtime string; raises `VersionMismatchError` or `FileNotFoundError` similarly.
+  - Local: compares the nanosecond mtime and atomically replaces the file without a lock. Portable filesystems do not provide an atomic compare-and-replace primitive, so another process can still write between the comparison and replacement.
 
   Example (optimistic concurrency):
   ```python
@@ -267,7 +267,7 @@ Below are the functions and classes exported by the library (`mx8fs.__all__`). P
 Install JSON storage dependencies with `pip install "mx8fs[json-storage]"`.
 
 - `class JsonFileStorage(base_path: str, randomizer: Callable | None = None)`: Base class for simple JSON model storage.
-  - Methods: `list()`, `read(key)`, `read_many(keys, max_workers=None)`, `write(model)`, `write_dict(dict, key=None)`, `update(model)`, `delete(key)`, `get_lock(key, wait_period=0.1, time_out_seconds=840, maximum_age=900)`.
+  - Methods: `list()`, `read(key)`, `read_with_version(key)`, `read_many(keys, max_workers=None)`, `write(model)`, `write_dict(dict, key=None)`, `update(model)`, `update_if_version(model, version)`, `mutate(key, function, max_attempts=3)`, `delete(key)`, `get_lock(key, wait_period=0.1, time_out_seconds=840, maximum_age=900)`.
   - Implements unique key generation and defers serialization to subclass hooks.
 
   Example (using factory below for a Pydantic model): see next section.
@@ -334,16 +334,79 @@ total = query.count()    # count before limit/offset
 models = query.models()  # concurrently load and validate the JSON models
 ```
 
-Every index definition is fingerprinted from the selected Pydantic fields. Missing or incompatible index tables are logged, recreated under a shared SQL lease, and rebuilt automatically from the canonical JSON files. Different storage paths using the same definition share a physical table but remain isolated by an internal namespace. Older fingerprinted table versions are retained for compatibility with older deployments.
+Every index definition is fingerprinted from the selected Pydantic fields. Missing index tables and namespaces are created and built automatically from canonical JSON. Existing incompatible or corrupt indexes are never migrated or healed automatically. Different storage paths using the same definition share a physical table but remain isolated by an internal namespace.
+
+Run index migrations as part of deployment, before serving traffic:
+
+```python
+jobs = JobStorage("s3://bucket/jobs")
+jobs.migrate_index()
+```
+
+`migrate_index()` explicitly replaces a missing or incompatible physical index when necessary, then rebuilds the current storage namespace. Normal operations validate readiness once per storage instance and raise `IndexSchemaError` with migration instructions when an existing index is incompatible. A corrupt local SQLite database raises its original database error and must be repaired or removed explicitly before migration.
 
 Indexed S3 storage requires `MX8FS_DSQL_ENDPOINT`. `MX8FS_DSQL_USER` defaults to `admin`, and `MX8FS_DSQL_DATABASE` defaults to `postgres`. AWS credentials and Region resolution use the normal AWS chain.
 
-`rebuild_index()` can be called to force a full reconciliation. Indexed mutations already acquire re-entrant per-key file locks, so an explicit read-modify-write lock remains safe:
+Aurora DSQL engines intentionally use SQLAlchemy `pool_pre_ping=True`. AWS Lambda execution environments can retain pooled database connections while frozen, after which the remote TLS session may have closed. Pre-ping invalidates that stale connection before application SQL executes. Do not disable it merely to remove a checkout round trip.
+
+`rebuild_index()` can be called to force a full reconciliation. Rebuilds read canonical objects concurrently with up to 100 workers by default, retain primitive SQL projections rather than full Pydantic models, replace the namespace index in bounded insert batches, and verify that source versions remained stable. If objects change during the rebuild, only changed, new, or deleted keys are repaired in bounded delta passes. Pass `max_workers` to tune read concurrency.
+
+Indexed writes use the ETag or local version returned by the canonical write to update the index without rereading uncontended JSON. The canonical version is checked afterward; a GET and another index synchronization happen only when another writer changed the object concurrently.
+
+#### Migrating every indexed storage
+
+Runtime storage paths may come from environment variables, dependency injection, tenant configuration, or application factories, so static source scanning cannot reliably construct every storage instance. Applications must provide an authoritative registry callable:
 
 ```python
-with jobs.get_lock("job-key"):
-    job = jobs.read("job-key")
-    jobs.update(job.model_copy(update={"status": "complete"}))
+# app/mx8fs_migrations.py
+def indexed_storages():
+    return [
+        JobStorage(settings.jobs_path),
+        UserStorage(settings.users_path),
+    ]
+```
+
+Expose that callable as an installed package entry point so only registries explicitly declared by the application can be loaded:
+
+```toml
+[project.entry-points."mx8fs.index_registries"]
+application = "app.mx8fs_migrations:indexed_storages"
+```
+
+Poetry applications can declare the same mapping under `[tool.poetry.plugins."mx8fs.index_registries"]`.
+
+Install the indexed storage extra and run one deployment migration job before starting application replicas:
+
+```bash
+mx8fs migrate-indexes application \
+  --jobs 4 \
+  --total-read-workers 100
+```
+
+The runner deduplicates physical table/namespace pairs, migrates each shared physical schema once, then rebuilds independent namespaces concurrently. `--jobs` limits concurrent namespace migrations. `--total-read-workers` is divided across those jobs so several migrations do not each create 100 S3 readers. Use `--dry-run` to print the migration plan without changing index schemas or namespaces, and `--json` for machine-readable results. Any failed schema or namespace produces a nonzero exit status while independent targets are still attempted.
+
+Do not run this command independently in every application replica. SQL leases protect schema operations, but repeated deployment jobs would still perform redundant namespace rebuilds.
+
+An advisory scanner helps find declarations that may be missing from the registry:
+
+```bash
+mx8fs discover-indexes ./src \
+  --registry application
+```
+
+The scanner parses Python without importing it and reports indexed `json_file_storage_factory(..., index=...)` declarations with file and line numbers. It understands direct imports, aliases, and module-qualified calls. Its results are advisory: dynamic calls, wrappers, and runtime-generated storage paths may not be discoverable, and the scanner never performs migrations. The explicit registry remains authoritative.
+
+All JSON storage exposes the same three update policies. Indexed storage adds index synchronization without acquiring per-record file locks:
+
+- `update(model)` always overwrites canonical JSON, then stabilizes its index from the latest canonical version.
+- `update_if_version(model, version)` performs one version-matched update attempt and raises `VersionMismatchError` when the observed version is already stale. S3 provides atomic compare-and-swap through `If-Match`; local storage has the portable-filesystem race described above.
+- `mutate(key, function, max_attempts=3)` rereads and reapplies a side-effect-free mutation after version conflicts.
+
+```python
+job = jobs.mutate(
+    "job-key",
+    lambda current: current.model_copy(update={"status": "complete"}),
+)
 ```
 
 ### Comparison Utilities

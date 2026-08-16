@@ -26,7 +26,8 @@ from typing import Any
 import pytest
 from pydantic import BaseModel
 
-from mx8fs import FileLock, JsonFileStorage, json_file_storage_factory
+from mx8fs import FileLock, JsonFileStorage, VersionMismatchError, json_file_storage_factory
+from mx8fs import storage as storage_module
 
 
 class StorageTestClass(BaseModel):
@@ -61,6 +62,54 @@ def test_read(file_storage: JsonFileStorage) -> None:
 
     content = file_storage.read("file1")
     assert content == StorageTestClass(value="content1", key="file1")
+
+
+def test_read_many_rejects_non_positive_workers(file_storage: JsonFileStorage) -> None:
+    with pytest.raises(ValueError, match="max_workers must be positive"):
+        file_storage.read_many([], max_workers=0)
+
+
+def test_read_and_update_with_version(file_storage: JsonFileStorage) -> None:
+    file_storage.write(StorageTestClass(value="content1"), "file1")
+    current, version = file_storage.read_with_version("file1")
+
+    assert current == StorageTestClass(value="content1", key="file1")
+    updated = file_storage.update_if_version(StorageTestClass(value="content2", key="file1"), version)
+    assert updated.value == "content2"
+
+    with pytest.raises(VersionMismatchError):
+        file_storage.update_if_version(StorageTestClass(value="stale", key="file1"), version)
+
+
+def test_mutate_retries_version_conflicts(file_storage: JsonFileStorage, monkeypatch: pytest.MonkeyPatch) -> None:
+    file_storage.write(StorageTestClass(value="content1"), "file1")
+    real_update = storage_module.update_file_if_version_matches
+    attempts = 0
+
+    def conflict_once(path: str, data: str, version: str) -> str:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            file_storage.update(StorageTestClass(value="concurrent", key="file1"))
+            raise VersionMismatchError("changed")
+        return real_update(path, data, version)
+
+    monkeypatch.setattr(storage_module, "update_file_if_version_matches", conflict_once)
+
+    result = file_storage.mutate("file1", lambda current: current.model_copy(update={"value": current.value + "!"}))
+
+    assert attempts == 2
+    assert result.value == "concurrent!"
+    assert file_storage.read("file1") == result
+
+
+def test_mutate_validates_attempts_and_key(file_storage: JsonFileStorage) -> None:
+    file_storage.write(StorageTestClass(value="content1"), "file1")
+
+    with pytest.raises(ValueError, match="positive"):
+        file_storage.mutate("file1", lambda current: current, max_attempts=0)
+    with pytest.raises(ValueError, match="storage key"):
+        file_storage.mutate("file1", lambda current: current.model_copy(update={"key": "file2"}))
 
 
 def test_write(file_storage: JsonFileStorage) -> None:

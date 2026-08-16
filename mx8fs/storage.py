@@ -24,15 +24,65 @@ import os
 import random
 import string
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from typing import TYPE_CHECKING, Any, cast, overload
 
-from .file_io import delete_file, file_exists, list_files, read_file, write_file
+from .file_io import (
+    VersionMismatchError,
+    delete_file,
+    file_exists,
+    list_files,
+    read_file,
+    read_file_with_version,
+    update_file_if_version_matches,
+    write_file,
+)
 from .lock import FileLock
 
 if TYPE_CHECKING:  # pragma: no cover
     from .index import JsonIndex
     from .indexed_storage import IndexedJsonFileStorage
+
+_MAX_VERSION_ATTEMPTS = 3
+_PARALLEL_PREFETCH_LIMIT = 1000
+
+
+def _parallel_map[InputT, OutputT](
+    function: Callable[[InputT], OutputT],
+    items: builtins.list[InputT],
+    max_workers: int | None = None,
+    on_result: Callable[[], None] | None = None,
+) -> builtins.list[OutputT]:
+    """Apply a function concurrently with bounded submissions while preserving order."""
+    workers = max_workers if max_workers is not None else min(32, (os.cpu_count() or 1) + 4)
+    if workers <= 0:
+        raise ValueError("max_workers must be positive")
+    if not items:
+        return []
+    max_pending = max(workers, min(_PARALLEL_PREFETCH_LIMIT, workers * 10))
+    results: dict[int, OutputT] = {}
+    indexed_items = iter(enumerate(items))
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        pending: dict[Future[OutputT], int] = {}
+
+        def submit_next() -> bool:
+            try:
+                index, item = next(indexed_items)
+            except StopIteration:
+                return False
+            pending[executor.submit(function, item)] = index
+            return True
+
+        for _ in range(min(max_pending, len(items))):
+            submit_next()
+        while pending:
+            completed, _ = wait(pending, return_when=FIRST_COMPLETED)
+            for future in completed:
+                results[pending.pop(future)] = future.result()
+                if on_result is not None:
+                    on_result()
+                submit_next()
+    return [results[index] for index in range(len(items))]
 
 
 class JsonFileStorage[ModelT]:
@@ -87,12 +137,14 @@ class JsonFileStorage[ModelT]:
         """Read a file from storage."""
         return self._json_to_model(read_file(self._get_path(key)))
 
+    def read_with_version(self, key: str) -> tuple[ModelT, str]:
+        """Read canonical JSON with its S3 ETag or local modification version."""
+        contents, version = read_file_with_version(self._get_path(key))
+        return self._json_to_model(contents), version
+
     def read_many(self, keys: builtins.list[str], max_workers: int | None = None) -> builtins.list[ModelT]:
         """Read multiple models concurrently while preserving key order."""
-        if not keys:
-            return []
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            return list(executor.map(self.read, keys))
+        return _parallel_map(self.read, keys, max_workers)
 
     def write(self, content: ModelT, key: str | None = None) -> ModelT:
         """Write a file to storage."""
@@ -114,11 +166,57 @@ class JsonFileStorage[ModelT]:
 
     def update(self, content: ModelT) -> ModelT:
         """Update a file in storage."""
-        write_file(
-            self._get_path(getattr(content, self._key_field)),
-            self._model_to_json(content),
-        )
+        self._write_with_version(content)
         return content
+
+    def _write_with_version(self, content: ModelT) -> str:
+        """Write canonical JSON and return the resulting version."""
+        return write_file(self._get_path(getattr(content, self._key_field)), self._model_to_json(content))
+
+    def update_if_version(self, content: ModelT, version: str) -> ModelT:
+        """Update canonical JSON only when its current version matches."""
+        self._update_if_version(content, version)
+        return content
+
+    def _update_if_version(self, content: ModelT, version: str) -> str:
+        """Conditionally write canonical JSON and return the resulting version."""
+        key = cast(str, getattr(content, self._key_field))
+        return update_file_if_version_matches(self._get_path(key), self._model_to_json(content), version)
+
+    def mutate(
+        self,
+        key: str,
+        mutation: Callable[[ModelT], ModelT],
+        max_attempts: int = _MAX_VERSION_ATTEMPTS,
+    ) -> ModelT:
+        """Apply a side-effect-free mutation using optimistic version checks."""
+        updated, _ = self._mutate_with_version(key, mutation, max_attempts)
+        return updated
+
+    def _mutate_with_version(
+        self,
+        key: str,
+        mutation: Callable[[ModelT], ModelT],
+        max_attempts: int,
+    ) -> tuple[ModelT, str]:
+        """Apply a mutation and return the model with its written version."""
+        if max_attempts <= 0:
+            raise ValueError("max_attempts must be positive")
+        mismatch: VersionMismatchError | None = None
+        for _ in range(max_attempts):
+            current, version = self.read_with_version(key)
+            updated = mutation(current)
+            updated_key = cast(str, getattr(updated, self._key_field))
+            if updated_key != key:
+                raise ValueError("Mutations may not change the storage key")
+            try:
+                written_version = self._update_if_version(updated, version)
+                return updated, written_version
+            except VersionMismatchError as error:
+                mismatch = error
+        raise VersionMismatchError(
+            f"JSON changed during all {max_attempts} mutation attempts for key {key}"
+        ) from mismatch
 
     def delete(self, key: str) -> None:
         """Delete a file from storage."""
