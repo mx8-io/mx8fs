@@ -16,6 +16,7 @@ from .cache import cache_to_disk, cache_to_disk_binary, get_cache_filename
 from .comparer import ResultsComparer
 from .file_io import (
     BinaryFileHandler,
+    FileMetadata,
     GzipFileHandler,
     VersionMismatchError,
     copy_file,
@@ -26,6 +27,7 @@ from .file_io import (
     get_folders,
     get_public_url,
     list_files,
+    list_files_with_metadata,
     most_recent_timestamp,
     move_file,
     purge_folder,
@@ -105,6 +107,7 @@ __all__ = [
     "delete_file",
     "delete_files",
     "file_exists",
+    "FileMetadata",
     "FileLock",
     "get_cache_filename",
     "get_public_url",
@@ -113,6 +116,7 @@ __all__ = [
     "json_file_storage_factory",
     "JsonFileStorage",
     "list_files",
+    "list_files_with_metadata",
     "most_recent_timestamp",
     "move_file",
     "read_file_with_version",

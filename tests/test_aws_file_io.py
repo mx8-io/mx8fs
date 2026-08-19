@@ -32,6 +32,7 @@ from botocore.stub import Stubber
 
 from mx8fs import (
     BinaryFileHandler,
+    FileMetadata,
     GzipFileHandler,
     VersionMismatchError,
     copy_file,
@@ -40,6 +41,7 @@ from mx8fs import (
     get_folders,
     get_public_url,
     list_files,
+    list_files_with_metadata,
     most_recent_timestamp,
     move_file,
     read_file,
@@ -125,6 +127,14 @@ def _test_list_files(path: str) -> None:
     versions = _list_file_versions(path, "txt")
     assert set(versions) == {"test1", "test2"}
     assert versions["test1"] == _get_file_version(os.path.join(path, TEST_FILE_1))
+
+    metadata = sorted(list_files_with_metadata(path, "txt"), key=lambda file: file.name)
+    assert [file.name for file in metadata] == ["test1", "test2"]
+    assert all(isinstance(file, FileMetadata) for file in metadata)
+    assert all(file.last_modified.tzinfo is UTC for file in metadata)
+    assert [file.size_bytes for file in metadata] == [5, 5]
+    assert metadata[0].version == versions["test1"]
+    assert [file.name for file in list_files_with_metadata(path, "txt", "test1")] == ["test1"]
 
     for files in [sorted(list_files(path, "txt")), sorted(list_files(path, "txt", "test"))]:
         assert len(files) == 2

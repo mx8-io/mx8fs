@@ -26,6 +26,7 @@ import urllib.request
 from collections.abc import Generator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from glob import glob
 from io import BytesIO
@@ -59,6 +60,16 @@ _S3_MULTIPART_CHUNK_SIZE = 8 * 1024 * 1024
 
 class VersionMismatchError(FileNotFoundError):
     """Custom error for version mismatch when writing files."""
+
+
+@dataclass(frozen=True, kw_only=True)
+class FileMetadata:
+    """Portable metadata returned for a listed file."""
+
+    name: str
+    last_modified: datetime
+    size_bytes: int
+    version: str
 
 
 def get_bucket_key(path: str) -> tuple[str, str]:
@@ -509,25 +520,49 @@ def list_files(root_path: str, file_type: str, prefix: str = "") -> list[str]:
     return [os.path.split(f)[1][: -len(file_type) - 1] for f in glob(os.path.join(root_path, f"{prefix}*.{file_type}"))]
 
 
-def _list_file_versions(root_path: str, file_type: str) -> dict[str, str]:
-    """Return storage keys mapped to their S3 ETag or local modification version."""
+def list_files_with_metadata(root_path: str, file_type: str, prefix: str = "") -> list[FileMetadata]:
+    """Return files and their portable metadata from S3 or local storage."""
     suffix = f".{file_type}"
     if root_path.startswith(S3_PREFIX):
         bucket, key = get_bucket_key(root_path)
         key = key + "/" if key and not key.endswith("/") else key
         paginator = s3_client.get_paginator("list_objects_v2")
-        versions: dict[str, str] = {}
-        for page in paginator.paginate(Bucket=bucket, Prefix=key, PaginationConfig={"PageSize": 10_000}):
+        files: list[FileMetadata] = []
+        for page in paginator.paginate(Bucket=bucket, Prefix=key + prefix, PaginationConfig={"PageSize": 10_000}):
             for item in page.get("Contents", []):
                 relative = str(item["Key"]).removeprefix(key)
                 if relative.endswith(suffix):
-                    versions[relative.removesuffix(suffix)] = str(item["ETag"]).strip('"')
-        return versions
+                    files.append(
+                        FileMetadata(
+                            name=relative.removesuffix(suffix),
+                            last_modified=cast(datetime, item["LastModified"]).astimezone(UTC),
+                            size_bytes=int(item["Size"]),
+                            version=str(item["ETag"]).strip('"'),
+                        )
+                    )
+        return files
 
-    return {
-        os.path.basename(file).removesuffix(suffix): str(os.stat(file).st_mtime_ns)
-        for file in glob(os.path.join(root_path, f"*{suffix}"))
-    }
+    files = []
+    for file in glob(os.path.join(root_path, f"{prefix}*{suffix}")):
+        try:
+            file_stat = os.stat(file)
+        except FileNotFoundError:  # pragma: no cover
+            # File may have been deleted after glob returned it.
+            continue
+        files.append(
+            FileMetadata(
+                name=os.path.basename(file).removesuffix(suffix),
+                last_modified=datetime.fromtimestamp(file_stat.st_mtime, tz=UTC),
+                size_bytes=file_stat.st_size,
+                version=str(file_stat.st_mtime_ns),
+            )
+        )
+    return files
+
+
+def _list_file_versions(root_path: str, file_type: str) -> dict[str, str]:
+    """Return storage keys mapped to their S3 ETag or local modification version."""
+    return {file.name: file.version for file in list_files_with_metadata(root_path, file_type)}
 
 
 def most_recent_timestamp(root_path: str, file_type: str) -> float:
