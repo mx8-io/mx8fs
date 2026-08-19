@@ -28,10 +28,12 @@ from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from typing import TYPE_CHECKING, Any, cast, overload
 
 from .file_io import (
+    FileMetadata,
     VersionMismatchError,
     delete_file,
     file_exists,
     list_files,
+    list_files_with_metadata,
     read_file,
     read_file_with_version,
     update_file_if_version_matches,
@@ -132,6 +134,10 @@ class JsonFileStorage[ModelT]:
     def list(self) -> list[str]:
         """List files in storage."""
         return list_files(self.base_path, self._extension)
+
+    def list_with_metadata(self) -> builtins.list[FileMetadata]:
+        """List files and their portable metadata in storage."""
+        return list_files_with_metadata(self.base_path, self._extension)
 
     def read(self, key: str) -> ModelT:
         """Read a file from storage."""

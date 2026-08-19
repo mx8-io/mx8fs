@@ -55,6 +55,10 @@ def test_list(file_storage: JsonFileStorage) -> None:
 
     assert sorted(file_storage.list()) == sorted(["file1", "file2"])
 
+    metadata = sorted(file_storage.list_with_metadata(), key=lambda file: file.name)
+    assert [file.name for file in metadata] == ["file1", "file2"]
+    assert all(file.size_bytes > 0 for file in metadata)
+
 
 def test_read(file_storage: JsonFileStorage) -> None:
     """Test the read method."""

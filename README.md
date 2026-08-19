@@ -136,6 +136,20 @@ Below are the functions and classes exported by the library (`mx8fs.__all__`). P
   names = list_files('/data', 'json', prefix='user_')  # ['user_1', 'user_2']
   ```
 
+- `list_files_with_metadata(root_path: str, file_type: str, prefix: str = "") -> list[FileMetadata]`: List files with portable metadata.
+  - Each result contains the extension-free `name`, UTC `last_modified`, `size_bytes`, and an opaque `version` token.
+  - S3 metadata comes from the object listing without additional `HeadObject` requests; local metadata comes from `stat`.
+
+  Example:
+  ```python
+  from datetime import UTC, datetime
+  from mx8fs import list_files_with_metadata
+
+  cutoff = datetime.now(UTC)
+  files = list_files_with_metadata('/data', 'json')
+  marked = [(file.name, file.last_modified > cutoff) for file in files]
+  ```
+
 - `get_folders(root_path: str, prefix: str = "") -> list[str]`: List immediate subfolders (non‑recursive).
   - S3: uses `Delimiter='/'` and returns top‑level folder names under the prefix.
   - Local: returns directory names directly under `root_path`.
@@ -267,7 +281,7 @@ Below are the functions and classes exported by the library (`mx8fs.__all__`). P
 Install JSON storage dependencies with `pip install "mx8fs[json-storage]"`.
 
 - `class JsonFileStorage(base_path: str, randomizer: Callable | None = None)`: Base class for simple JSON model storage.
-  - Methods: `list()`, `read(key)`, `read_with_version(key)`, `read_many(keys, max_workers=None)`, `write(model)`, `write_dict(dict, key=None)`, `update(model)`, `update_if_version(model, version)`, `mutate(key, function, max_attempts=3)`, `delete(key)`, `get_lock(key, wait_period=0.1, time_out_seconds=840, maximum_age=900)`.
+  - Methods: `list()`, `list_with_metadata()`, `read(key)`, `read_with_version(key)`, `read_many(keys, max_workers=None)`, `write(model)`, `write_dict(dict, key=None)`, `update(model)`, `update_if_version(model, version)`, `mutate(key, function, max_attempts=3)`, `delete(key)`, `get_lock(key, wait_period=0.1, time_out_seconds=840, maximum_age=900)`.
   - Implements unique key generation and defers serialization to subclass hooks.
 
   Example (using factory below for a Pydantic model): see next section.
