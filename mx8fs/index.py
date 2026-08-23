@@ -6,7 +6,6 @@ import hashlib
 import json
 import logging
 import os
-import random
 import re
 import threading
 import time
@@ -20,6 +19,7 @@ from datetime import date, datetime
 from decimal import Decimal
 from enum import Enum
 from functools import partial
+from secrets import SystemRandom
 from typing import Any, Literal, Union, cast, get_args, get_origin
 from uuid import UUID
 
@@ -65,6 +65,7 @@ DEFAULT_WRITE_BATCH_SIZE = 100
 _INDEX_TRANSACTION_ATTEMPTS = 3
 _INDEX_TRANSACTION_RETRY_SECONDS = 0.01
 _RETRYABLE_TRANSACTION_SQLSTATES = frozenset({"40001", "OC000"})
+_retry_random = SystemRandom()
 
 _catalog_initialized: weakref.WeakSet[Engine] = weakref.WeakSet()
 _catalog_initialized_lock = threading.Lock()
@@ -597,7 +598,7 @@ class IndexManager[ModelT]:
                 if not _is_retryable_transaction_conflict(error) or attempt == _INDEX_TRANSACTION_ATTEMPTS - 1:
                     raise
                 delay = _INDEX_TRANSACTION_RETRY_SECONDS * 2**attempt
-                time.sleep(random.uniform(0, delay))
+                time.sleep(_retry_random.uniform(0, delay))
 
     def _upsert_projections_batched(
         self,
