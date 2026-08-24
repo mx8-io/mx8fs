@@ -12,12 +12,14 @@ import time
 import types
 import uuid
 import weakref
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal
 from enum import Enum
+from functools import partial
+from secrets import SystemRandom
 from typing import Any, Literal, Union, cast, get_args, get_origin
 from uuid import UUID
 
@@ -45,8 +47,8 @@ from sqlalchemy import (
 )
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
-from sqlalchemy.engine import Engine, RowMapping
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.engine import Connection, Engine, RowMapping
+from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.schema import CreateIndex, CreateTable, DropTable
 from sqlalchemy.sql import ColumnElement, Select, visitors
 
@@ -60,9 +62,18 @@ CATALOG_DEFINITIONS = "_mx8fs_index_definitions"
 CATALOG_NAMESPACES = "_mx8fs_index_namespaces"
 CATALOG_LEASES = "_mx8fs_index_leases"
 DEFAULT_WRITE_BATCH_SIZE = 100
+_INDEX_TRANSACTION_ATTEMPTS = 3
+_INDEX_TRANSACTION_RETRY_SECONDS = 0.01
+_RETRYABLE_TRANSACTION_SQLSTATES = frozenset({"40001", "OC000"})
+_retry_random = SystemRandom()
 
 _catalog_initialized: weakref.WeakSet[Engine] = weakref.WeakSet()
 _catalog_initialized_lock = threading.Lock()
+
+
+def _is_retryable_transaction_conflict(error: DBAPIError) -> bool:
+    """Return whether a database error reports a serialization conflict."""
+    return getattr(error.orig, "sqlstate", None) in _RETRYABLE_TRANSACTION_SQLSTATES
 
 
 def _create_table(engine: Engine, table: Table) -> None:
@@ -568,14 +579,35 @@ class IndexManager[ModelT]:
         statement = self._upsert_statement()
         connection.execute(statement, projections)
 
+    def _execute_deletes(self, connection: Connection, keys: Sequence[str]) -> None:
+        connection.execute(
+            delete(self.index.table).where(
+                self.index.table.c[NAMESPACE_COLUMN] == self.namespace,
+                self.index.table.c[self.index.key_field].in_(keys),
+            )
+        )
+
+    def _run_write_transaction(self, operation: Callable[[Connection], None]) -> None:
+        """Run one index write transaction, retrying serialization conflicts."""
+        for attempt in range(_INDEX_TRANSACTION_ATTEMPTS):  # pragma: no branch - every final attempt returns or raises
+            try:
+                with self.engine.begin() as connection:
+                    operation(connection)
+                return
+            except DBAPIError as error:
+                if not _is_retryable_transaction_conflict(error) or attempt == _INDEX_TRANSACTION_ATTEMPTS - 1:
+                    raise
+                delay = _INDEX_TRANSACTION_RETRY_SECONDS * 2**attempt
+                time.sleep(_retry_random.uniform(0, delay))
+
     def _upsert_projections_batched(
         self,
         projections: Sequence[dict[str, Any]],
         batch_size: int,
     ) -> None:
         for start in range(0, len(projections), batch_size):
-            with self.engine.begin() as connection:
-                self._execute_upserts(connection, projections[start : start + batch_size])
+            batch = projections[start : start + batch_size]
+            self._run_write_transaction(partial(self._execute_upserts, projections=batch))
 
     def upsert_projection(self, projection: dict[str, Any]) -> None:
         """Insert or update one precomputed index projection."""
@@ -613,23 +645,12 @@ class IndexManager[ModelT]:
         if not keys:
             return
         for start in range(0, len(keys), batch_size):
-            with self.engine.begin() as connection:
-                connection.execute(
-                    delete(self.index.table).where(
-                        self.index.table.c[NAMESPACE_COLUMN] == self.namespace,
-                        self.index.table.c[self.index.key_field].in_(keys[start : start + batch_size]),
-                    )
-                )
+            batch = keys[start : start + batch_size]
+            self._run_write_transaction(partial(self._execute_deletes, keys=batch))
 
     def delete(self, key: str) -> None:
         """Delete one projected model row."""
-        with self.engine.begin() as connection:
-            connection.execute(
-                delete(self.index.table).where(
-                    self.index.table.c[NAMESPACE_COLUMN] == self.namespace,
-                    self.index.table.c[self.index.key_field] == key,
-                )
-            )
+        self._run_write_transaction(partial(self._execute_deletes, keys=[key]))
 
     def indexed_keys(self) -> set[str]:
         """Return all indexed keys for this namespace."""

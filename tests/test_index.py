@@ -562,6 +562,100 @@ def test_uncontended_update_indexes_known_version_without_rereading(
     assert indexed["status"] == "done"
 
 
+@pytest.mark.parametrize(
+    ("sqlstate", "conflicts_before_success"),
+    [("OC000", 1), ("40001", 1), ("OC000", 2)],
+)
+def test_update_retries_serialization_conflict(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    sqlstate: str,
+    conflicts_before_success: int,
+) -> None:
+    storage = make_storage(tmp_path)
+    storage.write(record("a", "pending", 1))
+    attempts = 0
+
+    class SerializationConflictError(RuntimeError):
+        def __init__(self, message: str, state: str) -> None:
+            super().__init__(message)
+            self.sqlstate = state
+
+    conflict = SerializationConflictError("transaction rejected", sqlstate)
+
+    def conflict_until_success(_: Any) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts <= conflicts_before_success:
+            raise DatabaseError("upsert", {}, conflict)
+
+    monkeypatch.setattr(index_module.time, "sleep", lambda _: None)
+    event.listen(storage._index_manager.engine, "commit", conflict_until_success)
+
+    try:
+        storage.update(record("a", "done", 2))
+    finally:
+        event.remove(storage._index_manager.engine, "commit", conflict_until_success)
+
+    assert attempts == conflicts_before_success + 1
+    assert storage.read("a").status == "done"
+    indexed = storage.query().first()
+    assert indexed is not None
+    assert indexed["status"] == "done"
+
+
+def test_update_exhausts_serialization_conflict_retries(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    storage = make_storage(tmp_path)
+    storage.write(record("a", "pending", 1))
+    attempts = 0
+
+    class SerializationConflictError(RuntimeError):
+        sqlstate = "OC000"
+
+    def conflict(_: Any) -> None:
+        nonlocal attempts
+        attempts += 1
+        raise DatabaseError("upsert", {}, SerializationConflictError("transaction rejected"))
+
+    monkeypatch.setattr(index_module.time, "sleep", lambda _: None)
+    event.listen(storage._index_manager.engine, "commit", conflict)
+
+    try:
+        with pytest.raises(IndexUpdateError, match="key a") as error:
+            storage.update(record("a", "done", 2))
+    finally:
+        event.remove(storage._index_manager.engine, "commit", conflict)
+
+    assert attempts == 3
+    assert isinstance(error.value.__cause__, DatabaseError)
+    assert storage.read("a").status == "done"
+
+
+def test_update_does_not_retry_other_database_errors(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    storage = make_storage(tmp_path)
+    storage.write(record("a", "pending", 1))
+    attempts = 0
+
+    class ConnectionFailureError(RuntimeError):
+        sqlstate = "08006"
+
+    def fail(_: Any) -> None:
+        nonlocal attempts
+        attempts += 1
+        raise DatabaseError("upsert", {}, ConnectionFailureError("connection lost"))
+
+    event.listen(storage._index_manager.engine, "commit", fail)
+
+    try:
+        with pytest.raises(IndexUpdateError, match="key a") as error:
+            storage.update(record("a", "done", 2))
+    finally:
+        event.remove(storage._index_manager.engine, "commit", fail)
+
+    assert attempts == 1
+    assert isinstance(error.value.__cause__, DatabaseError)
+
+
 def test_written_version_missing_during_check_falls_back_to_full_synchronization(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
