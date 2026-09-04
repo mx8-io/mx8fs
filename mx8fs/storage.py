@@ -29,7 +29,6 @@ from typing import TYPE_CHECKING, Any, cast, overload
 
 from .file_io import (
     FileMetadata,
-    FileNotDeletedError,
     FileVersionMetadata,
     VersionMismatchError,
     delete_file,
@@ -39,6 +38,7 @@ from .file_io import (
     list_files_with_metadata,
     read_file,
     read_file_with_version,
+    undelete_file,
     update_file_if_version_matches,
     write_file,
 )
@@ -245,19 +245,8 @@ class JsonFileStorage[ModelT]:
 
     def undelete(self, key: str) -> ModelT:
         """Restore the newest content when a stored file is deleted."""
-        versions = self.history(key)
-        if not versions:
-            raise FileNotFoundError(f"File {key} has no recoverable versions")
-        current = next((version for version in versions if version.is_latest), None)
-        if current is None:
-            raise FileNotFoundError(f"File {key} has no current version")
-        if not current.is_deleted:
-            raise FileNotDeletedError(f"File {key} is not deleted")
-        try:
-            version = max((item for item in versions if not item.is_deleted), key=lambda item: item.last_modified)
-        except ValueError as exc:
-            raise FileNotFoundError(f"File {key} has no recoverable versions") from exc
-        return self.restore_version(key, version.version_id)
+        undelete_file(self._get_path(key))
+        return self.read(key)
 
     def get_lock(
         self,

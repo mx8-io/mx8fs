@@ -24,7 +24,7 @@ from contextlib import nullcontext
 from datetime import UTC, datetime
 from io import BytesIO
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 import urllib3
@@ -53,6 +53,7 @@ from mx8fs import (
     most_recent_timestamp,
     move_file,
     read_file,
+    read_file_version,
     read_file_with_version,
     restore_file_version,
     undelete_file,
@@ -277,6 +278,13 @@ def test_local_version_history_restore_and_undelete(tmp_path: Path, monkeypatch:
         versions[1].revision,
     )
 
+    with monkeypatch.context() as context:
+        context.setattr(
+            "mx8fs.file_io.list_file_versions",
+            lambda _: pytest.fail("known-version reads must not list versions"),
+        )
+        assert read_file_version(str(file), versions[1]) == "existing"
+
     original_version = versions[1].version_id
     restored = restore_file_version(str(file), original_version)
     assert restored.is_latest
@@ -291,6 +299,8 @@ def test_local_version_history_restore_and_undelete(tmp_path: Path, monkeypatch:
     assert list_files(str(tmp_path), "txt", include_deleted=True) == ["test"]
     with pytest.raises(FileVersionDeletedError):
         read_file(str(file), version_id=deleted_versions[0].version_id)
+    with pytest.raises(FileVersionDeletedError):
+        read_file_version(str(file), deleted_versions[0])
 
     undeleted = undelete_file(str(file))
     assert undeleted.is_latest
@@ -315,6 +325,8 @@ def test_local_version_history_errors(tmp_path: Path, monkeypatch: pytest.Monkey
         undelete_file(file)
     with pytest.raises(VersioningNotSupportedError):
         list_file_versions("https://example.test/file.txt")
+    with pytest.raises(VersioningNotSupportedError):
+        read_file("https://example.test/file.txt", version_id="version")
 
     deleted = FileVersionMetadata(
         name="missing.txt",
@@ -378,17 +390,19 @@ def test_version_selection_uses_explicit_metadata(tmp_path: Path, monkeypatch: p
     assert list_files_with_metadata(str(tmp_path), "txt", include_deleted=True)[0].is_deleted
 
     monkeypatch.setattr("mx8fs.file_io.list_file_versions", lambda _: [stale, deleted, recoverable])
-    monkeypatch.setattr("mx8fs.file_io.read_file", lambda *_args, **_kwargs: "old")
+    monkeypatch.setattr("mx8fs.file_io._version_metadata", lambda *_: recoverable)
+    monkeypatch.setattr("mx8fs.file_io._current_version_metadata", lambda _: deleted)
+    monkeypatch.setattr("mx8fs.file_io.read_file_version", lambda *_args, **_kwargs: "old")
     monkeypatch.setattr("mx8fs.file_io.write_file", lambda *_args, **_kwargs: "new")
     assert restore_file_version(file, "recoverable") == deleted
 
     restored: list[str] = []
 
-    def restore(_: str, version_id: str) -> FileVersionMetadata:
-        restored.append(version_id)
+    def restore(_: str, version: FileVersionMetadata) -> FileVersionMetadata:
+        restored.append(version.version_id)
         return deleted
 
-    monkeypatch.setattr("mx8fs.file_io.restore_file_version", restore)
+    monkeypatch.setattr("mx8fs.file_io._restore_file_version", restore)
     undelete_file(file)
     assert restored == ["recoverable"]
 
@@ -512,7 +526,10 @@ def test_s3_version_history_and_deleted_listing(monkeypatch: pytest.MonkeyPatch)
         def paginate(self, **_: Any) -> list[dict[str, Any]]:
             return self.pages
 
+    paginator_calls: list[str] = []
+
     def get_paginator(name: str) -> Paginator:
+        paginator_calls.append(name)
         return Paginator([version_page if name == "list_object_versions" else current_page])
 
     monkeypatch.setattr(s3_client, "get_paginator", get_paginator)
@@ -525,6 +542,10 @@ def test_s3_version_history_and_deleted_listing(monkeypatch: pytest.MonkeyPatch)
     history = list_file_versions("s3://bucket/root/deleted.txt")
     assert [version.version_id for version in history] == ["delete-version", "old-version"]
     assert history[0].is_deleted
+    monkeypatch.setattr(
+        "mx8fs.file_io.list_file_versions",
+        lambda _: pytest.fail("version reads must not enumerate history"),
+    )
     assert read_file("s3://bucket/root/deleted.txt", version_id="old-version") == "old"
     assert read_file_with_version("s3://bucket/root/deleted.txt", version_id="old-version") == ("old", "old-etag")
 
@@ -536,6 +557,7 @@ def test_s3_version_history_and_deleted_listing(monkeypatch: pytest.MonkeyPatch)
         ("deleted", True),
         ("live", False),
     ]
+    assert paginator_calls == ["list_object_versions", "list_object_versions"]
 
 
 def test_s3_historical_read_translates_missing_version(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -569,6 +591,163 @@ def test_s3_historical_read_translates_missing_version(monkeypatch: pytest.Monke
     monkeypatch.setattr(s3_client, "get_object", lambda **_: (_ for _ in ()).throw(denied))
     with pytest.raises(ClientError, match="AccessDenied"):
         read_file("s3://bucket/key.txt", version_id="version")
+
+    deleted = ClientError({"Error": {"Code": "MethodNotAllowed", "Message": "deleted"}}, "GetObject")
+    monkeypatch.setattr(s3_client, "get_object", lambda **_: (_ for _ in ()).throw(deleted))
+    with pytest.raises(FileVersionDeletedError):
+        read_file("s3://bucket/key.txt", version_id="version")
+
+
+def test_s3_restore_uses_server_side_copy(monkeypatch: pytest.MonkeyPatch) -> None:
+    modified = datetime(2026, 1, 2, tzinfo=UTC)
+    copied: list[dict[str, Any]] = []
+    monkeypatch.setattr(s3_client, "copy_object", lambda **kwargs: copied.append(kwargs))
+    monkeypatch.setattr(
+        s3_client,
+        "head_object",
+        lambda **_: {
+            "VersionId": "restored",
+            "ETag": '"etag"',
+            "LastModified": modified,
+            "ContentLength": 4,
+        },
+    )
+
+    restored = restore_file_version("s3://bucket/key.txt", "historical")
+
+    assert restored.version_id == "restored"
+    assert copied == [
+        {
+            "Bucket": "bucket",
+            "Key": "key.txt",
+            "CopySource": {"Bucket": "bucket", "Key": "key.txt", "VersionId": "historical"},
+        }
+    ]
+
+
+def test_s3_restore_errors(monkeypatch: pytest.MonkeyPatch) -> None:
+    missing = ClientError({"Error": {"Code": "NoSuchVersion", "Message": "missing"}}, "CopyObject")
+    monkeypatch.setattr(s3_client, "copy_object", lambda **_: (_ for _ in ()).throw(missing))
+    with pytest.raises(VersionNotFoundError):
+        restore_file_version("s3://bucket/key.txt", "missing")
+
+    denied = ClientError({"Error": {"Code": "AccessDenied", "Message": "denied"}}, "CopyObject")
+    monkeypatch.setattr(s3_client, "copy_object", lambda **_: (_ for _ in ()).throw(denied))
+    with pytest.raises(ClientError, match="AccessDenied"):
+        restore_file_version("s3://bucket/key.txt", "denied")
+
+    monkeypatch.setattr(s3_client, "copy_object", lambda **_: {})
+    not_found = ClientError({"Error": {"Code": "404", "Message": "missing"}}, "HeadObject")
+    monkeypatch.setattr(s3_client, "head_object", lambda **_: (_ for _ in ()).throw(not_found))
+    with pytest.raises(FileNotFoundError):
+        restore_file_version("s3://bucket/key.txt", "version")
+
+    monkeypatch.setattr(s3_client, "head_object", lambda **_: (_ for _ in ()).throw(denied))
+    with pytest.raises(ClientError, match="AccessDenied"):
+        restore_file_version("s3://bucket/key.txt", "version")
+
+
+def test_s3_undelete_removes_current_delete_marker(monkeypatch: pytest.MonkeyPatch) -> None:
+    modified = datetime(2026, 1, 2, tzinfo=UTC)
+    deleted = ClientError(
+        cast(
+            Any,
+            {
+                "Error": {"Code": "404", "Message": "delete marker"},
+                "ResponseMetadata": {
+                    "HTTPHeaders": {
+                        "x-amz-delete-marker": "true",
+                        "x-amz-version-id": "deleted-version",
+                    }
+                },
+            },
+        ),
+        "HeadObject",
+    )
+    older_deleted = ClientError(
+        cast(
+            Any,
+            {
+                "Error": {"Code": "404", "Message": "delete marker"},
+                "ResponseMetadata": {
+                    "HTTPHeaders": {
+                        "x-amz-delete-marker": "true",
+                        "x-amz-version-id": "older-deleted-version",
+                    }
+                },
+            },
+        ),
+        "HeadObject",
+    )
+    responses: list[Any] = [
+        deleted,
+        older_deleted,
+        {
+            "VersionId": "revealed-version",
+            "ETag": '"etag"',
+            "LastModified": modified,
+            "ContentLength": 4,
+        },
+    ]
+
+    def head_object(**_: Any) -> dict[str, Any]:
+        response = responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return cast(dict[str, Any], response)
+
+    removed: list[dict[str, Any]] = []
+    monkeypatch.setattr(s3_client, "head_object", head_object)
+    monkeypatch.setattr(s3_client, "delete_object", lambda **kwargs: removed.append(kwargs))
+
+    restored = undelete_file("s3://bucket/key.txt")
+
+    assert restored.version_id == "revealed-version"
+    assert removed == [
+        {"Bucket": "bucket", "Key": "key.txt", "VersionId": "deleted-version"},
+        {"Bucket": "bucket", "Key": "key.txt", "VersionId": "older-deleted-version"},
+    ]
+
+
+def test_s3_undelete_errors(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(s3_client, "head_object", lambda **_: {})
+    with pytest.raises(FileNotDeletedError):
+        undelete_file("s3://bucket/key.txt")
+
+    missing = ClientError({"Error": {"Code": "404", "Message": "missing"}}, "HeadObject")
+    monkeypatch.setattr(s3_client, "head_object", lambda **_: (_ for _ in ()).throw(missing))
+    with pytest.raises(FileNotFoundError, match="no recoverable versions"):
+        undelete_file("s3://bucket/key.txt")
+
+    denied = ClientError({"Error": {"Code": "AccessDenied", "Message": "denied"}}, "HeadObject")
+    monkeypatch.setattr(s3_client, "head_object", lambda **_: (_ for _ in ()).throw(denied))
+    with pytest.raises(ClientError, match="AccessDenied"):
+        undelete_file("s3://bucket/key.txt")
+
+    deleted = ClientError(
+        cast(
+            Any,
+            {
+                "Error": {"Code": "404", "Message": "delete marker"},
+                "ResponseMetadata": {
+                    "HTTPHeaders": {
+                        "x-amz-delete-marker": "true",
+                        "x-amz-version-id": "deleted-version",
+                    }
+                },
+            },
+        ),
+        "HeadObject",
+    )
+    responses = [deleted, missing]
+
+    def head_object(**_: Any) -> dict[str, Any]:
+        raise responses.pop(0)
+
+    monkeypatch.setattr(s3_client, "head_object", head_object)
+    monkeypatch.setattr(s3_client, "delete_object", lambda **_: {})
+    with pytest.raises(FileNotFoundError, match="no recoverable versions"):
+        undelete_file("s3://bucket/key.txt")
 
 
 def test_s3_public_url_get_then_put() -> None:
