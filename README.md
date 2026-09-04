@@ -27,7 +27,8 @@ Below are the functions and classes exported by the library (`mx8fs.__all__`). P
   https_text = read_file('https://example.com/info.txt')
   ```
 
-- `read_file_with_version(path: str) -> tuple[str, str]`: Read text and a version identifier.
+- `read_file_with_version(path: str, *, version_id: str | None = None) -> tuple[str, str]`: Read text and a
+  concurrency version, optionally from a historical version.
   - S3: returns `(content, etag)` (quotes stripped).
   - Local: returns `(content, mtime-as-string)`.
 
@@ -65,6 +66,33 @@ Below are the functions and classes exported by the library (`mx8fs.__all__`). P
       # somebody else updated it — reload & retry as needed
       pass
   ```
+
+### File history
+
+S3 history follows the bucket's native versioning configuration. Local history is disabled by default and can be
+enabled process-wide:
+
+```bash
+MX8FS_LOCAL_VERSIONING=true
+```
+
+Enabled local history is stored in adjacent `.mx8fs-versions` sidecars. These directories are excluded from normal
+file and folder listings. Mutations made through mx8fs capture an existing file before changing it and append the
+resulting live version or delete marker afterward.
+
+- `list_file_versions(path: str) -> list[FileVersionMetadata]`: Return newest-first live versions and delete markers.
+- `read_file(path: str, *, version_id: str | None = None) -> str`: Read the current file or an explicit historical
+  version. Reading a delete marker raises `FileVersionDeletedError`.
+- `restore_file_version(path: str, version_id: str) -> FileVersionMetadata`: Restore historical content as a new
+  current version without rewriting history.
+- `undelete_file(path: str) -> FileVersionMetadata`: Restore the newest live version when the current state is a
+  delete marker.
+- `list_files(..., include_deleted=True)` and `list_files_with_metadata(..., include_deleted=True)`: Include names
+  whose latest state is deleted. Deleted metadata has `is_deleted=True`.
+
+Local history requests raise `VersioningNotEnabledError` while the environment switch is off. HTTPS paths raise
+`VersioningNotSupportedError`. Local changes made outside mx8fs are not recorded retroactively, although their
+current state is captured before the next mx8fs mutation.
 
 - `file_exists(path: str) -> bool`: True if file exists (HEAD on S3; `os.path.exists` locally).
 
@@ -281,7 +309,11 @@ Below are the functions and classes exported by the library (`mx8fs.__all__`). P
 Install JSON storage dependencies with `pip install "mx8fs[json-storage]"`.
 
 - `class JsonFileStorage(base_path: str, randomizer: Callable | None = None)`: Base class for simple JSON model storage.
-  - Methods: `list()`, `list_with_metadata()`, `read(key)`, `read_with_version(key)`, `read_many(keys, max_workers=None)`, `write(model)`, `write_dict(dict, key=None)`, `update(model)`, `update_if_version(model, version)`, `mutate(key, function, max_attempts=3)`, `delete(key)`, `get_lock(key, wait_period=0.1, time_out_seconds=840, maximum_age=900)`.
+  - Methods: `list(include_deleted=False)`, `list_with_metadata(include_deleted=False)`, `history(key)`,
+    `read(key)`, `read_with_version(key)`, `read_version(key, version_id)`, `read_many(keys, max_workers=None)`,
+    `write(model)`, `write_dict(dict, key=None)`, `update(model)`, `update_if_version(model, version)`,
+    `mutate(key, function, max_attempts=3)`, `delete(key)`, `restore_version(key, version_id)`, `undelete(key)`,
+    and `get_lock(key, wait_period=0.1, time_out_seconds=840, maximum_age=900)`.
   - Implements unique key generation and defers serialization to subclass hooks.
 
   Example (using factory below for a Pydantic model): see next section.
@@ -442,6 +474,11 @@ job = jobs.mutate(
 ### Exceptions
 
 - `class VersionMismatchError(FileNotFoundError)`: Raised by `update_file_if_version_matches` on conditional write mismatches.
+- `VersioningNotEnabledError`: Local history was requested while `MX8FS_LOCAL_VERSIONING` is off.
+- `VersioningNotSupportedError`: The path backend does not support history.
+- `VersionNotFoundError`: The requested historical version does not exist.
+- `FileVersionDeletedError`: The selected version is a delete marker and has no content.
+- `FileNotDeletedError`: Undelete was requested for a currently live file.
 
   Example (catching):
   ```python

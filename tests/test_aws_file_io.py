@@ -22,6 +22,7 @@ import os
 import time
 from contextlib import nullcontext
 from datetime import UTC, datetime
+from io import BytesIO
 from pathlib import Path
 from typing import Any
 
@@ -33,23 +34,39 @@ from botocore.stub import Stubber
 from mx8fs import (
     BinaryFileHandler,
     FileMetadata,
+    FileNotDeletedError,
+    FileVersionDeletedError,
+    FileVersionMetadata,
     GzipFileHandler,
+    VersioningNotEnabledError,
+    VersioningNotSupportedError,
     VersionMismatchError,
+    VersionNotFoundError,
     copy_file,
     delete_file,
     file_exists,
     get_folders,
     get_public_url,
+    list_file_versions,
     list_files,
     list_files_with_metadata,
     most_recent_timestamp,
     move_file,
     read_file,
     read_file_with_version,
+    restore_file_version,
+    undelete_file,
     update_file_if_version_matches,
     write_file,
 )
-from mx8fs.file_io import _get_file_version, _list_file_versions, get_bucket_key, get_files, purge_folder, s3_client
+from mx8fs.file_io import (
+    _get_file_version,
+    _list_current_file_versions,
+    get_bucket_key,
+    get_files,
+    purge_folder,
+    s3_client,
+)
 
 TEST_BUCKET_NAME = "mx8-test-bucket/mx8fs"
 
@@ -124,7 +141,7 @@ def _test_list_files(path: str) -> None:
     ignored_file = os.path.join(path, "ignored.json")
     write_file(ignored_file, "ignored")
 
-    versions = _list_file_versions(path, "txt")
+    versions = _list_current_file_versions(path, "txt")
     assert set(versions) == {"test1", "test2"}
     assert versions["test1"] == _get_file_version(os.path.join(path, TEST_FILE_1))
 
@@ -208,6 +225,204 @@ def test_local_public_url(tmp_path: Path) -> None:
     assert get_public_url(local_file) == local_file
 
 
+def test_local_versioning_defaults_off(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("MX8FS_LOCAL_VERSIONING", raising=False)
+    file = str(tmp_path / "test.txt")
+
+    write_file(file, "one")
+
+    assert not (tmp_path / ".mx8fs-versions").exists()
+    with pytest.raises(VersioningNotEnabledError):
+        list_file_versions(file)
+    with pytest.raises(VersioningNotEnabledError):
+        list_files(str(tmp_path), "txt", include_deleted=True)
+
+
+@pytest.mark.parametrize("value", ["1", "true", "TRUE", "yes", "on"])
+def test_local_versioning_enabled_values(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, value: str) -> None:
+    monkeypatch.setenv("MX8FS_LOCAL_VERSIONING", value)
+    file = str(tmp_path / "test.txt")
+
+    write_file(file, "one")
+
+    assert list_file_versions(file)[0].is_latest
+
+
+@pytest.mark.parametrize("value", ["0", "false", "FALSE", "no", "off", ""])
+def test_local_versioning_disabled_values(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, value: str) -> None:
+    monkeypatch.setenv("MX8FS_LOCAL_VERSIONING", value)
+    write_file(str(tmp_path / "test.txt"), "one")
+    assert not (tmp_path / ".mx8fs-versions").exists()
+
+
+def test_local_versioning_rejects_invalid_value(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MX8FS_LOCAL_VERSIONING", "perhaps")
+    with pytest.raises(ValueError, match="Invalid MX8FS_LOCAL_VERSIONING"):
+        write_file(str(tmp_path / "test.txt"), "one")
+
+
+def test_local_version_history_restore_and_undelete(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    file = tmp_path / "test.txt"
+    file.write_text("existing", encoding="utf-8")
+    monkeypatch.setenv("MX8FS_LOCAL_VERSIONING", "true")
+
+    write_file(str(file), "updated")
+    versions = list_file_versions(str(file))
+    assert len(versions) == 2
+    assert all(isinstance(version, FileVersionMetadata) for version in versions)
+    assert read_file(str(file), version_id=versions[0].version_id) == "updated"
+    assert read_file(str(file), version_id=versions[1].version_id) == "existing"
+    assert read_file_with_version(str(file), version_id=versions[1].version_id) == (
+        "existing",
+        versions[1].revision,
+    )
+
+    original_version = versions[1].version_id
+    restored = restore_file_version(str(file), original_version)
+    assert restored.is_latest
+    assert read_file(str(file)) == "existing"
+
+    delete_file(str(file))
+    deleted_versions = list_file_versions(str(file))
+    assert deleted_versions[0].is_deleted
+    assert list_files(str(tmp_path), "txt") == []
+    deleted_metadata = list_files_with_metadata(str(tmp_path), "txt", include_deleted=True)
+    assert [(item.name, item.is_deleted) for item in deleted_metadata] == [("test", True)]
+    assert list_files(str(tmp_path), "txt", include_deleted=True) == ["test"]
+    with pytest.raises(FileVersionDeletedError):
+        read_file(str(file), version_id=deleted_versions[0].version_id)
+
+    undeleted = undelete_file(str(file))
+    assert undeleted.is_latest
+    assert not undeleted.is_deleted
+    assert read_file(str(file)) == "existing"
+    with pytest.raises(FileNotDeletedError):
+        undelete_file(str(file))
+
+    assert ".mx8fs-versions" not in get_folders(str(tmp_path))
+    assert all(not path.startswith(".mx8fs-versions") for path in get_files(str(tmp_path)))
+
+
+def test_local_version_history_errors(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MX8FS_LOCAL_VERSIONING", "true")
+    file = str(tmp_path / "missing.txt")
+
+    assert list_file_versions(file) == []
+    delete_file(file)
+    with pytest.raises(VersionNotFoundError):
+        read_file(file, version_id="missing")
+    with pytest.raises(FileNotFoundError, match="no recoverable versions"):
+        undelete_file(file)
+    with pytest.raises(VersioningNotSupportedError):
+        list_file_versions("https://example.test/file.txt")
+
+    deleted = FileVersionMetadata(
+        name="missing.txt",
+        version_id="deleted",
+        last_modified=datetime.now(UTC),
+        size_bytes=0,
+        is_latest=True,
+        is_deleted=True,
+        revision=None,
+    )
+    monkeypatch.setattr("mx8fs.file_io.list_file_versions", lambda _: [deleted])
+    with pytest.raises(FileNotFoundError, match="no recoverable versions"):
+        undelete_file(file)
+    no_current = FileVersionMetadata(
+        name="missing.txt",
+        version_id="stale",
+        last_modified=datetime.now(UTC),
+        size_bytes=0,
+        is_latest=False,
+        is_deleted=True,
+        revision=None,
+    )
+    monkeypatch.setattr("mx8fs.file_io.list_file_versions", lambda _: [no_current])
+    with pytest.raises(FileNotFoundError, match="no current version"):
+        undelete_file(file)
+
+
+def test_version_selection_uses_explicit_metadata(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    file = str(tmp_path / "test.txt")
+    older = datetime(2026, 1, 1, tzinfo=UTC)
+    newer = datetime(2026, 1, 2, tzinfo=UTC)
+    recoverable = FileVersionMetadata(
+        name="test.txt",
+        version_id="recoverable",
+        last_modified=newer,
+        size_bytes=3,
+        is_latest=False,
+        is_deleted=False,
+        revision="etag",
+    )
+    deleted = FileVersionMetadata(
+        name="test.txt",
+        version_id="deleted",
+        last_modified=older,
+        size_bytes=0,
+        is_latest=True,
+        is_deleted=True,
+        revision=None,
+    )
+    stale = FileVersionMetadata(
+        name="test.txt",
+        version_id="stale",
+        last_modified=older,
+        size_bytes=3,
+        is_latest=False,
+        is_deleted=False,
+        revision="etag",
+    )
+
+    monkeypatch.setattr("mx8fs.file_io._list_versions", lambda *_args, **_kwargs: [recoverable, deleted])
+    assert list_files_with_metadata(str(tmp_path), "txt", include_deleted=True)[0].is_deleted
+
+    monkeypatch.setattr("mx8fs.file_io.list_file_versions", lambda _: [stale, deleted, recoverable])
+    monkeypatch.setattr("mx8fs.file_io.read_file", lambda *_args, **_kwargs: "old")
+    monkeypatch.setattr("mx8fs.file_io.write_file", lambda *_args, **_kwargs: "new")
+    assert restore_file_version(file, "recoverable") == deleted
+
+    restored: list[str] = []
+
+    def restore(_: str, version_id: str) -> FileVersionMetadata:
+        restored.append(version_id)
+        return deleted
+
+    monkeypatch.setattr("mx8fs.file_io.restore_file_version", restore)
+    undelete_file(file)
+    assert restored == ["recoverable"]
+
+
+def test_local_binary_write_open_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MX8FS_LOCAL_VERSIONING", "true")
+    real_open = open
+
+    def fail_open(file: str, *args: Any, **kwargs: Any) -> Any:
+        if file == str(tmp_path / "blocked.bin"):
+            raise PermissionError("blocked")
+        return real_open(file, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.open", fail_open)
+    with pytest.raises(PermissionError, match="blocked"):
+        BinaryFileHandler(str(tmp_path / "blocked.bin"), "wb")
+
+
+def test_local_binary_copy_and_move_versions(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MX8FS_LOCAL_VERSIONING", "true")
+    source = str(tmp_path / "source.bin")
+    copied = str(tmp_path / "copied.bin")
+    moved = str(tmp_path / "moved.bin")
+
+    with BinaryFileHandler(source, "wb") as output:
+        output.write(b"binary")
+    copy_file(source, copied)
+    move_file(copied, moved)
+
+    assert len(list_file_versions(source)) == 1
+    assert len(list_file_versions(moved)) == 1
+    assert list_file_versions(copied)[0].is_deleted
+
+
 def _fetch_url(url: str) -> urllib3.BaseHTTPResponse:
     """Fetch a URL"""
     http = urllib3.PoolManager()
@@ -239,6 +454,121 @@ def test_s3_version_lookup_propagates_unexpected_errors(monkeypatch: pytest.Monk
 
     with pytest.raises(ClientError, match="AccessDenied"):
         _get_file_version("s3://bucket/key")
+
+
+def test_s3_version_history_and_deleted_listing(monkeypatch: pytest.MonkeyPatch) -> None:
+    modified = datetime(2026, 1, 2, tzinfo=UTC)
+    version_page = {
+        "Versions": [
+            {
+                "Key": "root/live.txt",
+                "VersionId": "live-version",
+                "LastModified": modified,
+                "Size": 4,
+                "IsLatest": True,
+                "ETag": '"live-etag"',
+            },
+            {
+                "Key": "root/deleted.txt",
+                "VersionId": "old-version",
+                "LastModified": modified.replace(day=1),
+                "Size": 3,
+                "IsLatest": False,
+                "ETag": '"old-etag"',
+            },
+            {
+                "Key": "root/deleted.txt.extra",
+                "VersionId": "unrelated",
+                "LastModified": modified,
+                "Size": 1,
+                "IsLatest": True,
+                "ETag": '"unrelated"',
+            },
+        ],
+        "DeleteMarkers": [
+            {
+                "Key": "root/deleted.txt",
+                "VersionId": "delete-version",
+                "LastModified": modified,
+                "IsLatest": True,
+            }
+        ],
+    }
+    current_page = {
+        "Contents": [
+            {
+                "Key": "root/live.txt",
+                "LastModified": modified,
+                "Size": 4,
+                "ETag": '"live-etag"',
+            }
+        ]
+    }
+
+    class Paginator:
+        def __init__(self, pages: list[dict[str, Any]]) -> None:
+            self.pages = pages
+
+        def paginate(self, **_: Any) -> list[dict[str, Any]]:
+            return self.pages
+
+    def get_paginator(name: str) -> Paginator:
+        return Paginator([version_page if name == "list_object_versions" else current_page])
+
+    monkeypatch.setattr(s3_client, "get_paginator", get_paginator)
+    monkeypatch.setattr(
+        s3_client,
+        "get_object",
+        lambda **_: {"Body": BytesIO(b"old"), "ETag": '"old-etag"'},
+    )
+
+    history = list_file_versions("s3://bucket/root/deleted.txt")
+    assert [version.version_id for version in history] == ["delete-version", "old-version"]
+    assert history[0].is_deleted
+    assert read_file("s3://bucket/root/deleted.txt", version_id="old-version") == "old"
+    assert read_file_with_version("s3://bucket/root/deleted.txt", version_id="old-version") == ("old", "old-etag")
+
+    metadata = sorted(
+        list_files_with_metadata("s3://bucket/root/", "txt", include_deleted=True),
+        key=lambda item: item.name,
+    )
+    assert [(item.name, item.is_deleted) for item in metadata] == [
+        ("deleted", True),
+        ("live", False),
+    ]
+
+
+def test_s3_historical_read_translates_missing_version(monkeypatch: pytest.MonkeyPatch) -> None:
+    modified = datetime(2026, 1, 2, tzinfo=UTC)
+
+    class Paginator:
+        def paginate(self, **_: Any) -> list[dict[str, Any]]:
+            return [
+                {
+                    "Versions": [
+                        {
+                            "Key": "key.txt",
+                            "VersionId": "version",
+                            "LastModified": modified,
+                            "Size": 4,
+                            "IsLatest": True,
+                            "ETag": '"etag"',
+                        }
+                    ]
+                }
+            ]
+
+    monkeypatch.setattr(s3_client, "get_paginator", lambda _: Paginator())
+    error = ClientError({"Error": {"Code": "NoSuchVersion", "Message": "missing"}}, "GetObject")
+    monkeypatch.setattr(s3_client, "get_object", lambda **_: (_ for _ in ()).throw(error))
+
+    with pytest.raises(VersionNotFoundError):
+        read_file("s3://bucket/key.txt", version_id="version")
+
+    denied = ClientError({"Error": {"Code": "AccessDenied", "Message": "denied"}}, "GetObject")
+    monkeypatch.setattr(s3_client, "get_object", lambda **_: (_ for _ in ()).throw(denied))
+    with pytest.raises(ClientError, match="AccessDenied"):
+        read_file("s3://bucket/key.txt", version_id="version")
 
 
 def test_s3_public_url_get_then_put() -> None:

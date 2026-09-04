@@ -19,14 +19,21 @@ TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR TH
 
 # pylint: disable=protected-access
 
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 import pytest
 from pydantic import BaseModel
 
-from mx8fs import FileLock, JsonFileStorage, VersionMismatchError, json_file_storage_factory
+from mx8fs import (
+    FileLock,
+    FileNotDeletedError,
+    FileVersionMetadata,
+    JsonFileStorage,
+    VersionMismatchError,
+    json_file_storage_factory,
+)
 from mx8fs import storage as storage_module
 
 
@@ -66,6 +73,101 @@ def test_read(file_storage: JsonFileStorage) -> None:
 
     content = file_storage.read("file1")
     assert content == StorageTestClass(value="content1", key="file1")
+
+
+def test_version_history_restore_and_undelete(file_storage: JsonFileStorage, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MX8FS_LOCAL_VERSIONING", "true")
+    file_storage.write(StorageTestClass(value="one"), "file1")
+    first_version = file_storage.history("file1")[0].version_id
+    file_storage.update(StorageTestClass(value="two", key="file1"))
+
+    assert file_storage.read_version("file1", first_version).value == "one"
+    assert file_storage.restore_version("file1", first_version).value == "one"
+
+    file_storage.delete("file1")
+    assert file_storage.list() == []
+    assert file_storage.list(include_deleted=True) == ["file1"]
+    assert file_storage.list_with_metadata(include_deleted=True)[0].is_deleted
+    assert file_storage.undelete("file1").value == "one"
+
+
+def test_undelete_errors(file_storage: JsonFileStorage, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MX8FS_LOCAL_VERSIONING", "true")
+    with pytest.raises(FileNotFoundError, match="no recoverable versions"):
+        file_storage.undelete("missing")
+
+    file_storage.write(StorageTestClass(value="live"), "live")
+    with pytest.raises(FileNotDeletedError):
+        file_storage.undelete("live")
+
+    deleted = FileVersionMetadata(
+        name="gone.txt",
+        version_id="deleted",
+        last_modified=datetime.now(),
+        size_bytes=0,
+        is_latest=True,
+        is_deleted=True,
+        revision=None,
+    )
+    monkeypatch.setattr(file_storage, "history", lambda _: [deleted])
+    with pytest.raises(FileNotFoundError, match="no recoverable versions"):
+        file_storage.undelete("gone")
+    no_current = FileVersionMetadata(
+        name="gone.txt",
+        version_id="stale",
+        last_modified=datetime.now(),
+        size_bytes=0,
+        is_latest=False,
+        is_deleted=True,
+        revision=None,
+    )
+    monkeypatch.setattr(file_storage, "history", lambda _: [no_current])
+    with pytest.raises(FileNotFoundError, match="no current version"):
+        file_storage.undelete("gone")
+
+
+def test_undelete_uses_explicit_version_metadata(
+    file_storage: JsonFileStorage, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    older = datetime(2026, 1, 1)
+    newer = datetime(2026, 1, 2)
+    versions = [
+        FileVersionMetadata(
+            name="file.json",
+            version_id="old",
+            last_modified=older,
+            size_bytes=1,
+            is_latest=False,
+            is_deleted=False,
+            revision="old",
+        ),
+        FileVersionMetadata(
+            name="file.json",
+            version_id="deleted",
+            last_modified=older,
+            size_bytes=0,
+            is_latest=True,
+            is_deleted=True,
+            revision=None,
+        ),
+        FileVersionMetadata(
+            name="file.json",
+            version_id="new",
+            last_modified=newer,
+            size_bytes=1,
+            is_latest=False,
+            is_deleted=False,
+            revision="new",
+        ),
+    ]
+    monkeypatch.setattr(file_storage, "history", lambda _: versions)
+    monkeypatch.setattr(
+        file_storage,
+        "restore_version",
+        lambda _, version_id: StorageTestClass(value=version_id),
+    )
+
+    assert file_storage.undelete("file").value == "new"
 
 
 def test_read_many_rejects_non_positive_workers(file_storage: JsonFileStorage) -> None:
