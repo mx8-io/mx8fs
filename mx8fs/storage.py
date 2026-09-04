@@ -29,9 +29,12 @@ from typing import TYPE_CHECKING, Any, cast, overload
 
 from .file_io import (
     FileMetadata,
+    FileNotDeletedError,
+    FileVersionMetadata,
     VersionMismatchError,
     delete_file,
     file_exists,
+    list_file_versions,
     list_files,
     list_files_with_metadata,
     read_file,
@@ -131,13 +134,17 @@ class JsonFileStorage[ModelT]:
 
         return key
 
-    def list(self) -> list[str]:
+    def list(self, *, include_deleted: bool = False) -> list[str]:
         """List files in storage."""
-        return list_files(self.base_path, self._extension)
+        return list_files(self.base_path, self._extension, include_deleted=include_deleted)
 
-    def list_with_metadata(self) -> builtins.list[FileMetadata]:
+    def list_with_metadata(self, *, include_deleted: bool = False) -> builtins.list[FileMetadata]:
         """List files and their portable metadata in storage."""
-        return list_files_with_metadata(self.base_path, self._extension)
+        return list_files_with_metadata(self.base_path, self._extension, include_deleted=include_deleted)
+
+    def history(self, key: str) -> builtins.list[FileVersionMetadata]:
+        """List historical versions and delete markers for a stored file."""
+        return list_file_versions(self._get_path(key))
 
     def read(self, key: str) -> ModelT:
         """Read a file from storage."""
@@ -147,6 +154,10 @@ class JsonFileStorage[ModelT]:
         """Read canonical JSON with its S3 ETag or local modification version."""
         contents, version = read_file_with_version(self._get_path(key))
         return self._json_to_model(contents), version
+
+    def read_version(self, key: str, version_id: str) -> ModelT:
+        """Read a specific historical version."""
+        return self._json_to_model(read_file(self._get_path(key), version_id=version_id))
 
     def read_many(self, keys: builtins.list[str], max_workers: int | None = None) -> builtins.list[ModelT]:
         """Read multiple models concurrently while preserving key order."""
@@ -227,6 +238,23 @@ class JsonFileStorage[ModelT]:
     def delete(self, key: str) -> None:
         """Delete a file from storage."""
         delete_file(self._get_path(key))
+
+    def restore_version(self, key: str, version_id: str) -> ModelT:
+        """Restore a historical model as the new current version."""
+        return self.update(self.read_version(key, version_id))
+
+    def undelete(self, key: str) -> ModelT:
+        """Restore the newest content when a stored file is deleted."""
+        versions = self.history(key)
+        if not versions:
+            raise FileNotFoundError(f"File {key} has no recoverable versions")
+        if not versions[0].is_deleted:
+            raise FileNotDeletedError(f"File {key} is not deleted")
+        try:
+            version = next(item for item in versions[1:] if not item.is_deleted)
+        except StopIteration as exc:
+            raise FileNotFoundError(f"File {key} has no recoverable versions") from exc
+        return self.restore_version(key, version.version_id)
 
     def get_lock(
         self,

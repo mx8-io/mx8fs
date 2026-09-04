@@ -14,7 +14,7 @@ from sqlalchemy.engine import Engine
 
 from .file_io import (
     _get_file_version,
-    _list_file_versions,
+    _list_current_file_versions,
     read_file_with_version,
 )
 from .index import (
@@ -170,7 +170,7 @@ class IndexedJsonFileStorage[ModelT](JsonFileStorage[ModelT]):
     def _reconcile_index(self, lease: Any, max_workers: int | None = None) -> IndexRebuildResult:
         initial_indexed_keys = self._index_manager.indexed_keys()
         workers = _DEFAULT_REBUILD_WORKERS if max_workers is None else max_workers
-        listed_versions = _list_file_versions(self.base_path, self._extension)
+        listed_versions = _list_current_file_versions(self.base_path, self._extension)
         results = _parallel_map(
             self._read_rebuild_key,
             sorted(listed_versions),
@@ -184,7 +184,7 @@ class IndexedJsonFileStorage[ModelT](JsonFileStorage[ModelT]):
         lease.maybe_renew()
 
         for _ in range(_MAX_VERSION_ATTEMPTS):
-            current_versions = _list_file_versions(self.base_path, self._extension)
+            current_versions = _list_current_file_versions(self.base_path, self._extension)
             if current_versions == observed_versions:
                 return IndexRebuildResult(
                     upserted=len(indexed_keys),

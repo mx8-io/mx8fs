@@ -378,7 +378,7 @@ def test_rebuild_reconciles_different_keys_concurrently(tmp_path: Path, monkeypa
         rendezvous.wait(timeout=1)
         return key, projection(storage, record(key, "pending", 1), versions[key]), versions[key]
 
-    monkeypatch.setattr(indexed_storage_module, "_list_file_versions", lambda *_: versions)
+    monkeypatch.setattr(indexed_storage_module, "_list_current_file_versions", lambda *_: versions)
     monkeypatch.setattr(storage, "_read_rebuild_key", read_rebuild_key)
 
     assert storage.rebuild_index(max_workers=2) == index_module.IndexRebuildResult(upserted=2, removed=0)
@@ -980,7 +980,7 @@ def test_rebuild_handles_files_changing_after_listing(tmp_path: Path, monkeypatc
     storage.write(record("current", "pending", 1))
 
     listings = iter([{"current": "old"}, {}])
-    monkeypatch.setattr(indexed_storage_module, "_list_file_versions", lambda *_: next(listings))
+    monkeypatch.setattr(indexed_storage_module, "_list_current_file_versions", lambda *_: next(listings))
     monkeypatch.setattr(storage, "_read_rebuild_key", lambda key: (key, None, None))
     result = storage.rebuild_index()
     assert result == index_module.IndexRebuildResult(upserted=0, removed=1)
@@ -988,7 +988,7 @@ def test_rebuild_handles_files_changing_after_listing(tmp_path: Path, monkeypatc
     monkeypatch.undo()
     storage._index_manager.upsert(record("appeared", "done", 2))
     listings = iter([{}, {"appeared": "new"}, {"appeared": "new"}, {"appeared": "new"}])
-    monkeypatch.setattr(indexed_storage_module, "_list_file_versions", lambda *_: next(listings))
+    monkeypatch.setattr(indexed_storage_module, "_list_current_file_versions", lambda *_: next(listings))
     monkeypatch.setattr(
         storage,
         "_read_rebuild_key",
@@ -1030,7 +1030,7 @@ def test_rebuild_repairs_only_changed_projection_after_bulk_replace(
         delta_keys.extend(item[storage._key_field] for item in projections)
         real_upsert(projections, **kwargs)
 
-    monkeypatch.setattr(indexed_storage_module, "_list_file_versions", lambda *_: next(listings))
+    monkeypatch.setattr(indexed_storage_module, "_list_current_file_versions", lambda *_: next(listings))
     monkeypatch.setattr(storage, "_read_rebuild_key", read_projection)
     monkeypatch.setattr(storage._index_manager, "replace_namespace", replace)
     monkeypatch.setattr(storage._index_manager, "upsert_projections", upsert)
@@ -1069,7 +1069,7 @@ def test_rebuild_delta_handles_disappearing_and_malformed_keys(tmp_path: Path, m
         projected, version = next(reads[key])
         return key, projected, version
 
-    monkeypatch.setattr(indexed_storage_module, "_list_file_versions", lambda *_: next(listings))
+    monkeypatch.setattr(indexed_storage_module, "_list_current_file_versions", lambda *_: next(listings))
     monkeypatch.setattr(storage, "_read_rebuild_key", read_projection)
 
     result = storage.rebuild_index(max_workers=1)
@@ -1099,7 +1099,7 @@ def test_rebuild_fails_when_source_versions_never_stabilize(tmp_path: Path, monk
         version += 1
         return {"a": str(version)}
 
-    monkeypatch.setattr(indexed_storage_module, "_list_file_versions", changing_versions)
+    monkeypatch.setattr(indexed_storage_module, "_list_current_file_versions", changing_versions)
     monkeypatch.setattr(
         storage,
         "_read_rebuild_key",
