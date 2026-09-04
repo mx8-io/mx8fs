@@ -248,11 +248,14 @@ class JsonFileStorage[ModelT]:
         versions = self.history(key)
         if not versions:
             raise FileNotFoundError(f"File {key} has no recoverable versions")
-        if not versions[0].is_deleted:
+        current = next((version for version in versions if version.is_latest), None)
+        if current is None:
+            raise FileNotFoundError(f"File {key} has no current version")
+        if not current.is_deleted:
             raise FileNotDeletedError(f"File {key} is not deleted")
         try:
-            version = next(item for item in versions[1:] if not item.is_deleted)
-        except StopIteration as exc:
+            version = max((item for item in versions if not item.is_deleted), key=lambda item: item.last_modified)
+        except ValueError as exc:
             raise FileNotFoundError(f"File {key} has no recoverable versions") from exc
         return self.restore_version(key, version.version_id)
 

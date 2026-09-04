@@ -796,11 +796,9 @@ def list_files_with_metadata(
         current = list_files_with_metadata(root_path, file_type, prefix)
         current_names = {file.name for file in current}
         suffix = f".{file_type}"
-        latest_versions: dict[str, FileVersionMetadata] = {}
-        for version in _list_versions(root_path, exact=False):
-            latest = latest_versions.get(version.name)
-            if latest is None or version.last_modified > latest.last_modified:
-                latest_versions[version.name] = version
+        latest_versions = {
+            version.name: version for version in _list_versions(root_path, exact=False) if version.is_latest
+        }
         deleted = [
             FileMetadata(
                 name=version.name.removesuffix(suffix),
@@ -864,7 +862,10 @@ def restore_file_version(file: str, version_id: str) -> FileVersionMetadata:
     """Restore historical text content as a new current version."""
     data = read_file(file, version_id=version_id)
     write_file(file, data)
-    return list_file_versions(file)[0]
+    try:
+        return next(version for version in list_file_versions(file) if version.is_latest)
+    except StopIteration as exc:  # pragma: no cover - successful writes create a current version
+        raise VersionNotFoundError(f"Restored version of {file} not found") from exc
 
 
 def undelete_file(file: str) -> FileVersionMetadata:
@@ -872,11 +873,14 @@ def undelete_file(file: str) -> FileVersionMetadata:
     versions = list_file_versions(file)
     if not versions:
         raise FileNotFoundError(f"File {file} has no recoverable versions")
-    if not versions[0].is_deleted:
+    current = next((version for version in versions if version.is_latest), None)
+    if current is None:
+        raise FileNotFoundError(f"File {file} has no current version")
+    if not current.is_deleted:
         raise FileNotDeletedError(f"File {file} is not deleted")
     try:
-        version = next(item for item in versions[1:] if not item.is_deleted)
-    except StopIteration as exc:
+        version = max((item for item in versions if not item.is_deleted), key=lambda item: item.last_modified)
+    except ValueError as exc:
         raise FileNotFoundError(f"File {file} has no recoverable versions") from exc
     return restore_file_version(file, version.version_id)
 

@@ -328,6 +328,69 @@ def test_local_version_history_errors(tmp_path: Path, monkeypatch: pytest.Monkey
     monkeypatch.setattr("mx8fs.file_io.list_file_versions", lambda _: [deleted])
     with pytest.raises(FileNotFoundError, match="no recoverable versions"):
         undelete_file(file)
+    no_current = FileVersionMetadata(
+        name="missing.txt",
+        version_id="stale",
+        last_modified=datetime.now(UTC),
+        size_bytes=0,
+        is_latest=False,
+        is_deleted=True,
+        revision=None,
+    )
+    monkeypatch.setattr("mx8fs.file_io.list_file_versions", lambda _: [no_current])
+    with pytest.raises(FileNotFoundError, match="no current version"):
+        undelete_file(file)
+
+
+def test_version_selection_uses_explicit_metadata(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    file = str(tmp_path / "test.txt")
+    older = datetime(2026, 1, 1, tzinfo=UTC)
+    newer = datetime(2026, 1, 2, tzinfo=UTC)
+    recoverable = FileVersionMetadata(
+        name="test.txt",
+        version_id="recoverable",
+        last_modified=newer,
+        size_bytes=3,
+        is_latest=False,
+        is_deleted=False,
+        revision="etag",
+    )
+    deleted = FileVersionMetadata(
+        name="test.txt",
+        version_id="deleted",
+        last_modified=older,
+        size_bytes=0,
+        is_latest=True,
+        is_deleted=True,
+        revision=None,
+    )
+    stale = FileVersionMetadata(
+        name="test.txt",
+        version_id="stale",
+        last_modified=older,
+        size_bytes=3,
+        is_latest=False,
+        is_deleted=False,
+        revision="etag",
+    )
+
+    monkeypatch.setattr("mx8fs.file_io._list_versions", lambda *_args, **_kwargs: [recoverable, deleted])
+    assert list_files_with_metadata(str(tmp_path), "txt", include_deleted=True)[0].is_deleted
+
+    monkeypatch.setattr("mx8fs.file_io.list_file_versions", lambda _: [stale, deleted, recoverable])
+    monkeypatch.setattr("mx8fs.file_io.read_file", lambda *_args, **_kwargs: "old")
+    monkeypatch.setattr("mx8fs.file_io.write_file", lambda *_args, **_kwargs: "new")
+    assert restore_file_version(file, "recoverable") == deleted
+
+    restored: list[str] = []
+
+    def restore(_: str, version_id: str) -> FileVersionMetadata:
+        restored.append(version_id)
+        return deleted
+
+    monkeypatch.setattr("mx8fs.file_io.restore_file_version", restore)
+    undelete_file(file)
+    assert restored == ["recoverable"]
 
 
 def test_local_binary_write_open_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

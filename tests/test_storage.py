@@ -112,6 +112,62 @@ def test_undelete_errors(file_storage: JsonFileStorage, monkeypatch: pytest.Monk
     monkeypatch.setattr(file_storage, "history", lambda _: [deleted])
     with pytest.raises(FileNotFoundError, match="no recoverable versions"):
         file_storage.undelete("gone")
+    no_current = FileVersionMetadata(
+        name="gone.txt",
+        version_id="stale",
+        last_modified=datetime.now(),
+        size_bytes=0,
+        is_latest=False,
+        is_deleted=True,
+        revision=None,
+    )
+    monkeypatch.setattr(file_storage, "history", lambda _: [no_current])
+    with pytest.raises(FileNotFoundError, match="no current version"):
+        file_storage.undelete("gone")
+
+
+def test_undelete_uses_explicit_version_metadata(
+    file_storage: JsonFileStorage, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    older = datetime(2026, 1, 1)
+    newer = datetime(2026, 1, 2)
+    versions = [
+        FileVersionMetadata(
+            name="file.json",
+            version_id="old",
+            last_modified=older,
+            size_bytes=1,
+            is_latest=False,
+            is_deleted=False,
+            revision="old",
+        ),
+        FileVersionMetadata(
+            name="file.json",
+            version_id="deleted",
+            last_modified=older,
+            size_bytes=0,
+            is_latest=True,
+            is_deleted=True,
+            revision=None,
+        ),
+        FileVersionMetadata(
+            name="file.json",
+            version_id="new",
+            last_modified=newer,
+            size_bytes=1,
+            is_latest=False,
+            is_deleted=False,
+            revision="new",
+        ),
+    ]
+    monkeypatch.setattr(file_storage, "history", lambda _: versions)
+    monkeypatch.setattr(
+        file_storage,
+        "restore_version",
+        lambda _, version_id: StorageTestClass(value=version_id),
+    )
+
+    assert file_storage.undelete("file").value == "new"
 
 
 def test_read_many_rejects_non_positive_workers(file_storage: JsonFileStorage) -> None:
