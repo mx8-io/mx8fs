@@ -29,7 +29,7 @@ import urllib.request
 from collections.abc import Generator, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from glob import glob
 from io import BytesIO
@@ -88,17 +88,6 @@ class FileNotDeletedError(ValueError):
 
 
 @dataclass(frozen=True, kw_only=True)
-class FileMetadata:
-    """Portable metadata returned for a listed file."""
-
-    name: str
-    last_modified: datetime
-    size_bytes: int
-    version: str
-    is_deleted: bool = False
-
-
-@dataclass(frozen=True, kw_only=True)
 class FileVersionMetadata:
     """Portable metadata for one immutable file version or delete marker."""
 
@@ -109,6 +98,18 @@ class FileVersionMetadata:
     is_latest: bool
     is_deleted: bool
     revision: str | None
+
+
+@dataclass(frozen=True, kw_only=True)
+class FileMetadata:
+    """Portable metadata returned for a listed file."""
+
+    name: str
+    last_modified: datetime
+    size_bytes: int
+    version: str
+    is_deleted: bool = False
+    latest_readable_version: FileVersionMetadata | None = None
 
 
 def _local_versioning_enabled() -> bool:
@@ -836,6 +837,19 @@ def list_files(root_path: str, file_type: str, prefix: str = "", *, include_dele
     return [os.path.split(f)[1][: -len(file_type) - 1] for f in glob(os.path.join(root_path, f"{prefix}*.{file_type}"))]
 
 
+def _summarize_versions(
+    versions: list[FileVersionMetadata],
+) -> tuple[dict[str, FileVersionMetadata], dict[str, FileVersionMetadata]]:
+    """Return each key's current state and newest readable version."""
+    latest_versions = {version.name: version for version in versions if version.is_latest}
+    latest_readable_versions: dict[str, FileVersionMetadata] = {}
+    for version in versions:
+        current = latest_readable_versions.get(version.name)
+        if not version.is_deleted and (current is None or version.last_modified > current.last_modified):
+            latest_readable_versions[version.name] = version
+    return latest_versions, latest_readable_versions
+
+
 def list_files_with_metadata(
     root_path: str,
     file_type: str,
@@ -846,9 +860,8 @@ def list_files_with_metadata(
     """Return files and their portable metadata from S3 or local storage."""
     if include_deleted:
         suffix = f".{file_type}"
-        latest_versions = {
-            version.name: version for version in _list_versions(root_path, exact=False) if version.is_latest
-        }
+        versions = _list_versions(root_path, exact=False)
+        latest_versions, latest_readable_versions = _summarize_versions(versions)
         versioned = [
             FileMetadata(
                 name=version.name.removesuffix(suffix),
@@ -856,6 +869,7 @@ def list_files_with_metadata(
                 size_bytes=version.size_bytes,
                 version=version.version_id if version.is_deleted else version.revision or version.version_id,
                 is_deleted=version.is_deleted,
+                latest_readable_version=latest_readable_versions.get(version.name),
             )
             for version in latest_versions.values()
             if version.name.endswith(suffix) and version.name.removesuffix(suffix).startswith(prefix)
@@ -864,6 +878,15 @@ def list_files_with_metadata(
             return versioned
 
         current = list_files_with_metadata(root_path, file_type, prefix)
+        versioned_by_name = {file.name: file for file in versioned}
+        current = [
+            (
+                replace(file, latest_readable_version=versioned_by_name[file.name].latest_readable_version)
+                if file.name in versioned_by_name
+                else file
+            )
+            for file in current
+        ]
         current_names = {file.name for file in current}
         deleted = [file for file in versioned if file.is_deleted and file.name not in current_names]
         return current + deleted
