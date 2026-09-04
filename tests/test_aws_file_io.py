@@ -719,6 +719,11 @@ def test_s3_undelete_errors(monkeypatch: pytest.MonkeyPatch) -> None:
     with pytest.raises(FileNotFoundError, match="no recoverable versions"):
         undelete_file("s3://bucket/key.txt")
 
+    denied = ClientError({"Error": {"Code": "AccessDenied", "Message": "denied"}}, "HeadObject")
+    monkeypatch.setattr(s3_client, "head_object", lambda **_: (_ for _ in ()).throw(denied))
+    with pytest.raises(ClientError, match="AccessDenied"):
+        undelete_file("s3://bucket/key.txt")
+
     deleted = ClientError(
         cast(
             Any,

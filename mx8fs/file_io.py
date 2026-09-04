@@ -970,7 +970,9 @@ def _undelete_s3_file(file: str) -> FileVersionMetadata:
         except s3_client.exceptions.ClientError as exc:
             headers = exc.response.get("ResponseMetadata", {}).get("HTTPHeaders", {})
             if str(headers.get("x-amz-delete-marker", "")).lower() != "true":
-                raise FileNotFoundError(f"File {file} has no recoverable versions") from exc
+                if exc.response["Error"]["Code"] in {"404", "NoSuchKey", "NotFound"}:
+                    raise FileNotFoundError(f"File {file} has no recoverable versions") from exc
+                raise
             version_id = headers.get("x-amz-version-id")
             if not version_id:  # pragma: no cover - S3 identifies current delete markers
                 raise VersionNotFoundError(f"Current delete marker of {file} has no version ID") from exc
