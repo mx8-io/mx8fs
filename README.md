@@ -81,6 +81,8 @@ file and folder listings. Mutations made through mx8fs capture an existing file 
 resulting live version or delete marker afterward.
 
 - `list_file_versions(path: str) -> list[FileVersionMetadata]`: Return newest-first live versions and delete markers.
+- `read_file_version(path: str, version: FileVersionMetadata) -> str`: Read a previously listed version without
+  listing its metadata again.
 - `read_file(path: str, *, version_id: str | None = None) -> str`: Read the current file or an explicit historical
   version. Reading a delete marker raises `FileVersionDeletedError`.
 - `restore_file_version(path: str, version_id: str) -> FileVersionMetadata`: Restore historical content as a new

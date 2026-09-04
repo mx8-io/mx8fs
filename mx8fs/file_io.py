@@ -26,7 +26,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
-from collections.abc import Generator
+from collections.abc import Generator, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -173,6 +173,18 @@ def _load_local_versions_from_path(history_path: str) -> list[FileVersionMetadat
             raw_versions.append(cast(dict[str, Any], json.load(metadata_file)))
     raw_versions.sort(key=lambda item: int(item["created_ns"]), reverse=True)
     return [_local_version_from_json(item, is_latest=index == 0) for index, item in enumerate(raw_versions)]
+
+
+def _load_local_version(file: str, version_id: str) -> FileVersionMetadata:
+    """Load one local version directly from its sidecar metadata."""
+    history_path = _require_local_history_path(file)
+    metadata_path = os.path.join(history_path, "versions", f"{version_id}.json")
+    try:
+        with open(metadata_path, encoding="UTF-8") as metadata_file:
+            data = cast(dict[str, Any], json.load(metadata_file))
+    except FileNotFoundError as exc:
+        raise VersionNotFoundError(f"Version {version_id} of {file} not found") from exc
+    return _local_version_from_json(data, is_latest=False)
 
 
 def _append_local_version(file: str, *, deleted: bool, force: bool = False) -> None:
@@ -324,42 +336,53 @@ def list_file_versions(file: str) -> list[FileVersionMetadata]:
 
 
 def _version_metadata(file: str, version_id: str) -> FileVersionMetadata:
-    """Return metadata for a requested version or raise."""
-    try:
-        return next(version for version in list_file_versions(file) if version.version_id == version_id)
-    except StopIteration as exc:
-        raise VersionNotFoundError(f"Version {version_id} of {file} not found") from exc
+    """Return metadata for a requested local version or raise."""
+    return _load_local_version(file, version_id)
 
 
-def _read_version(file: str, version_id: str) -> str:
+def _read_version(
+    file: str,
+    version_id: str,
+    *,
+    metadata: FileVersionMetadata | None = None,
+) -> tuple[str, str]:
     """Read historical content through the single historical-read backend branch."""
-    metadata = _version_metadata(file, version_id)
-    if metadata.is_deleted:
+    if metadata is not None and metadata.is_deleted:
         raise FileVersionDeletedError(f"Version {version_id} of {file} is a delete marker")
     if file.startswith(S3_PREFIX):
         bucket, key = get_bucket_key(file)
         try:
             response = s3_client.get_object(Bucket=bucket, Key=key, VersionId=version_id)
         except s3_client.exceptions.ClientError as exc:
-            if exc.response["Error"]["Code"] in {"NoSuchKey", "NoSuchVersion", "MethodNotAllowed"}:
+            if exc.response["Error"]["Code"] == "MethodNotAllowed":
+                raise FileVersionDeletedError(f"Version {version_id} of {file} is a delete marker") from exc
+            if exc.response["Error"]["Code"] in {"NoSuchKey", "NoSuchVersion"}:
                 raise VersionNotFoundError(f"Version {version_id} of {file} not found") from exc
             raise
-        return str(response["Body"].read().decode("utf-8"))
-    if file.startswith(_HTTPS_PREFIX):  # pragma: no cover - rejected by metadata lookup
+        return str(response["Body"].read().decode("utf-8")), str(response["ETag"]).strip('"')
+    if file.startswith(_HTTPS_PREFIX):
         raise VersioningNotSupportedError("HTTPS paths do not expose version history")
+    metadata = metadata or _version_metadata(file, version_id)
+    if metadata.is_deleted:
+        raise FileVersionDeletedError(f"Version {version_id} of {file} is a delete marker")
     history_path = _require_local_history_path(file)
     data_path = os.path.join(history_path, "versions", f"{version_id}.data")
     try:
         with open(data_path, encoding="UTF-8") as version_file:
-            return version_file.read()
+            return version_file.read(), metadata.revision or metadata.version_id
     except FileNotFoundError as exc:  # pragma: no cover - corrupt sidecar
         raise VersionNotFoundError(f"Version {version_id} of {file} not found") from exc
+
+
+def read_file_version(file: str, version: FileVersionMetadata) -> str:
+    """Read a previously listed file version without listing its metadata again."""
+    return _read_version(file, version.version_id, metadata=version)[0]
 
 
 def read_file(file: str, *, version_id: str | None = None) -> str:
     """Read a file from S3, HTTPS, or local storage with UTF-8 encoding."""
     if version_id is not None:
-        return _read_version(file, version_id)
+        return _read_version(file, version_id)[0]
     if file.startswith(S3_PREFIX):
         bucket, key = get_bucket_key(file)
         try:
@@ -385,8 +408,7 @@ def read_file_with_version(file: str, *, version_id: str | None = None) -> tuple
     :return: The file contents and the version identifier
     """
     if version_id is not None:
-        metadata = _version_metadata(file, version_id)
-        return _read_version(file, version_id), metadata.revision or metadata.version_id
+        return _read_version(file, version_id)
     if file.startswith(S3_PREFIX):
         bucket, key = get_bucket_key(file)
         try:
@@ -413,6 +435,36 @@ def _get_file_version(file: str) -> str:
         return str(os.stat(file).st_mtime_ns)
     except FileNotFoundError as exc:
         raise FileNotFoundError(f"File {file} not found") from exc
+
+
+def _s3_version_metadata(key: str, response: Mapping[str, Any]) -> FileVersionMetadata:
+    """Convert a successful S3 HeadObject response to portable metadata."""
+    return FileVersionMetadata(
+        name=os.path.basename(key),
+        version_id=str(response.get("VersionId", response["ETag"])).strip('"'),
+        last_modified=cast(datetime, response["LastModified"]).astimezone(UTC),
+        size_bytes=int(response["ContentLength"]),
+        is_latest=True,
+        is_deleted=False,
+        revision=str(response["ETag"]).strip('"'),
+    )
+
+
+def _current_version_metadata(file: str) -> FileVersionMetadata:
+    """Return current version metadata without enumerating history."""
+    if file.startswith(S3_PREFIX):
+        bucket, key = get_bucket_key(file)
+        try:
+            response = s3_client.head_object(Bucket=bucket, Key=key)
+        except s3_client.exceptions.ClientError as exc:
+            if exc.response["Error"]["Code"] in {"404", "NoSuchKey", "NotFound"}:
+                raise FileNotFoundError(f"File {file} not found") from exc
+            raise
+        return _s3_version_metadata(key, response)
+    versions = _load_local_versions_from_path(_require_local_history_path(file))
+    if not versions:  # pragma: no cover - successful versioned writes create metadata
+        raise VersionNotFoundError(f"Current version of {file} not found")
+    return versions[0]
 
 
 def write_file(file: str, data: str) -> str:
@@ -793,26 +845,27 @@ def list_files_with_metadata(
 ) -> list[FileMetadata]:
     """Return files and their portable metadata from S3 or local storage."""
     if include_deleted:
-        current = list_files_with_metadata(root_path, file_type, prefix)
-        current_names = {file.name for file in current}
         suffix = f".{file_type}"
         latest_versions = {
             version.name: version for version in _list_versions(root_path, exact=False) if version.is_latest
         }
-        deleted = [
+        versioned = [
             FileMetadata(
                 name=version.name.removesuffix(suffix),
                 last_modified=version.last_modified,
-                size_bytes=0,
-                version=version.version_id,
-                is_deleted=True,
+                size_bytes=version.size_bytes,
+                version=version.version_id if version.is_deleted else version.revision or version.version_id,
+                is_deleted=version.is_deleted,
             )
             for version in latest_versions.values()
-            if version.is_deleted
-            and version.name.endswith(suffix)
-            and version.name.removesuffix(suffix).startswith(prefix)
-            and version.name.removesuffix(suffix) not in current_names
+            if version.name.endswith(suffix) and version.name.removesuffix(suffix).startswith(prefix)
         ]
+        if root_path.startswith(S3_PREFIX):
+            return versioned
+
+        current = list_files_with_metadata(root_path, file_type, prefix)
+        current_names = {file.name for file in current}
+        deleted = [file for file in versioned if file.is_deleted and file.name not in current_names]
         return current + deleted
 
     suffix = f".{file_type}"
@@ -858,18 +911,40 @@ def _list_current_file_versions(root_path: str, file_type: str) -> dict[str, str
     return {file.name: file.version for file in list_files_with_metadata(root_path, file_type)}
 
 
+def _restore_file_version(file: str, version: FileVersionMetadata) -> FileVersionMetadata:
+    """Restore known historical text content as a new current version."""
+    data = read_file_version(file, version)
+    write_file(file, data)
+    return _current_version_metadata(file)
+
+
+def _restore_s3_file_version(file: str, version_id: str) -> FileVersionMetadata:
+    """Restore an S3 version with a server-side copy."""
+    bucket, key = get_bucket_key(file)
+    try:
+        s3_client.copy_object(
+            Bucket=bucket,
+            Key=key,
+            CopySource={"Bucket": bucket, "Key": key, "VersionId": version_id},
+        )
+    except s3_client.exceptions.ClientError as exc:
+        if exc.response["Error"]["Code"] in {"NoSuchKey", "NoSuchVersion"}:
+            raise VersionNotFoundError(f"Version {version_id} of {file} not found") from exc
+        raise
+    return _current_version_metadata(file)
+
+
 def restore_file_version(file: str, version_id: str) -> FileVersionMetadata:
     """Restore historical text content as a new current version."""
-    data = read_file(file, version_id=version_id)
-    write_file(file, data)
-    try:
-        return next(version for version in list_file_versions(file) if version.is_latest)
-    except StopIteration as exc:  # pragma: no cover - successful writes create a current version
-        raise VersionNotFoundError(f"Restored version of {file} not found") from exc
+    if file.startswith(S3_PREFIX):
+        return _restore_s3_file_version(file, version_id)
+    return _restore_file_version(file, _version_metadata(file, version_id))
 
 
 def undelete_file(file: str) -> FileVersionMetadata:
     """Restore the newest available content when the current state is deleted."""
+    if file.startswith(S3_PREFIX):
+        return _undelete_s3_file(file)
     versions = list_file_versions(file)
     if not versions:
         raise FileNotFoundError(f"File {file} has no recoverable versions")
@@ -882,7 +957,29 @@ def undelete_file(file: str) -> FileVersionMetadata:
         version = max((item for item in versions if not item.is_deleted), key=lambda item: item.last_modified)
     except ValueError as exc:
         raise FileNotFoundError(f"File {file} has no recoverable versions") from exc
-    return restore_file_version(file, version.version_id)
+    return _restore_file_version(file, version)
+
+
+def _undelete_s3_file(file: str) -> FileVersionMetadata:
+    """Remove current S3 delete markers so the newest live version becomes current."""
+    bucket, key = get_bucket_key(file)
+    removed_marker = False
+    while True:
+        try:
+            response = s3_client.head_object(Bucket=bucket, Key=key)
+        except s3_client.exceptions.ClientError as exc:
+            headers = exc.response.get("ResponseMetadata", {}).get("HTTPHeaders", {})
+            if str(headers.get("x-amz-delete-marker", "")).lower() != "true":
+                raise FileNotFoundError(f"File {file} has no recoverable versions") from exc
+            version_id = headers.get("x-amz-version-id")
+            if not version_id:  # pragma: no cover - S3 identifies current delete markers
+                raise VersionNotFoundError(f"Current delete marker of {file} has no version ID") from exc
+            s3_client.delete_object(Bucket=bucket, Key=key, VersionId=version_id)
+            removed_marker = True
+            continue
+        if not removed_marker:
+            raise FileNotDeletedError(f"File {file} is not deleted")
+        return _s3_version_metadata(key, response)
 
 
 def most_recent_timestamp(root_path: str, file_type: str) -> float:
