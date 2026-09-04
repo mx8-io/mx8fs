@@ -296,6 +296,8 @@ def test_local_version_history_restore_and_undelete(tmp_path: Path, monkeypatch:
     assert list_files(str(tmp_path), "txt") == []
     deleted_metadata = list_files_with_metadata(str(tmp_path), "txt", include_deleted=True)
     assert [(item.name, item.is_deleted) for item in deleted_metadata] == [("test", True)]
+    assert deleted_metadata[0].latest_readable_version == deleted_versions[1]
+    assert read_file_version(str(file), deleted_metadata[0].latest_readable_version) == "existing"
     assert list_files(str(tmp_path), "txt", include_deleted=True) == ["test"]
     with pytest.raises(FileVersionDeletedError):
         read_file(str(file), version_id=deleted_versions[0].version_id)
@@ -557,6 +559,11 @@ def test_s3_version_history_and_deleted_listing(monkeypatch: pytest.MonkeyPatch)
         ("deleted", True),
         ("live", False),
     ]
+    assert metadata[0].latest_readable_version is not None
+    assert metadata[0].latest_readable_version.version_id == "old-version"
+    assert read_file_version("s3://bucket/root/deleted.txt", metadata[0].latest_readable_version) == "old"
+    assert metadata[1].latest_readable_version is not None
+    assert metadata[1].latest_readable_version.version_id == "live-version"
     assert paginator_calls == ["list_object_versions", "list_object_versions"]
 
 

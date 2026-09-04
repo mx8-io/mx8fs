@@ -90,7 +90,9 @@ resulting live version or delete marker afterward.
 - `undelete_file(path: str) -> FileVersionMetadata`: Restore the newest live version when the current state is a
   delete marker.
 - `list_files(..., include_deleted=True)` and `list_files_with_metadata(..., include_deleted=True)`: Include names
-  whose latest state is deleted. Deleted metadata has `is_deleted=True`.
+  whose latest state is deleted. Deleted metadata has `is_deleted=True`, and `latest_readable_version` contains the
+  newest live `FileVersionMetadata` found by the same bulk history scan. Pass it directly to `read_file_version()`;
+  it is `None` when the key has no readable version.
 
 Local history requests raise `VersioningNotEnabledError` while the environment switch is off. HTTPS paths raise
 `VersioningNotSupportedError`. Local changes made outside mx8fs are not recorded retroactively, although their
