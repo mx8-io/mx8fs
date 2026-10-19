@@ -348,6 +348,22 @@ def test_basename_only_local_lock(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
         pass
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="Unix guards retain their inode across release")
+def test_local_guard_preserves_an_open_inode_across_transactions(tmp_path: Path) -> None:
+    file = str(tmp_path / "resource")
+    guard_path = Path(f"{file}.lock.guard")
+    with FileLock(file):
+        descriptor = os.open(guard_path, os.O_RDONLY)
+    try:
+        original = os.fstat(descriptor)
+        assert original.st_nlink == 1
+        with FileLock(file):
+            assert guard_path.stat().st_ino == original.st_ino
+        assert guard_path.stat().st_ino == original.st_ino
+    finally:
+        os.close(descriptor)
+
+
 class TestWaiter:
     """Test the Waiter class."""
 

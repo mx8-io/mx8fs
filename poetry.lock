@@ -1846,4 +1846,4 @@ json-storage = ["pydantic"]
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.12"
-content-hash = "945b1140612194a14f08296591c2b4e319a9e3f09c2df135f35aeee2ad1687d7"
+content-hash = "1da6a4abaa315c185a0877d2517806bd47198d0646659ed53ec16a674fb9a166"

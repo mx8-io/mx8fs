@@ -15,6 +15,10 @@ and a local OS-backed guard, prevent a delayed contender from acquiring a lock t
 another client already holds. Local locking also retains a `{file}.lock.guard` file
 for synchronization; keep that file in place while clients are running.
 
+`filelock` is pinned to 3.20.3 to preserve the Unix guard inode across operations.
+Do not override this dependency: mixing guard lifecycles can allow overlapping
+locks even when every client runs mx8fs 2.x.
+
 **1.x and 2.x clients must not acquire locks for the same resource concurrently.**
 The new protocol does not inspect legacy candidate files, so clients using different
 protocols can enter the same critical section.
