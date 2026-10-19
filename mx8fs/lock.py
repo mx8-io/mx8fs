@@ -43,7 +43,7 @@ from dataclasses import dataclass
 from datetime import timedelta
 from math import isfinite
 from time import sleep, time
-from typing import Any
+from typing import Any, cast
 from uuid import uuid4
 
 from botocore.exceptions import ClientError
@@ -268,10 +268,9 @@ class _S3Lock(BaseLock):
         return _LockClaim(claim_id=claim_id, etag=response["ETag"])
 
     def _try_release(self, claim: _LockClaim) -> bool:
-        assert claim.etag is not None
         try:
             # Retain our acquired ETag; a fresh read could authorize deleting a successor.
-            s3_client.delete_object(Bucket=self._bucket, Key=self._key, IfMatch=claim.etag)
+            s3_client.delete_object(Bucket=self._bucket, Key=self._key, IfMatch=cast(str, claim.etag))
         except ClientError as error:
             status = error.response["ResponseMetadata"]["HTTPStatusCode"]
             if status == 409:
