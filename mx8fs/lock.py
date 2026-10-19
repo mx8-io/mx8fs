@@ -212,7 +212,7 @@ class _LocalLock(BaseLock):
                 current = self._read_lock()
                 if current is not None and self._is_unexpired(current, maximum_age):
                     return None
-                _atomic_write_bytes(self._lock_file, self._encode_claim_record(claim_id))
+                _atomic_write_bytes(os.path.abspath(self._lock_file), self._encode_claim_record(claim_id))
                 return _LockClaim(claim_id=claim_id)
         except LocalLockTimeout:
             return None

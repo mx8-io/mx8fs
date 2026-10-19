@@ -337,6 +337,17 @@ def test_local_release_preserves_claim_while_guard_is_busy(tmp_path: Path) -> No
         pass
 
 
+def test_basename_only_local_lock(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    with FileLock("resource", wait_period=0, time_out_seconds=0):
+        with pytest.raises(TimeoutError):
+            with FileLock(str(tmp_path / "resource"), wait_period=0, time_out_seconds=0):
+                pytest.fail("Relative and absolute paths acquired the same resource concurrently")
+    assert not Path("resource.lock").exists()
+    with FileLock("resource", time_out_seconds=1):
+        pass
+
+
 class TestWaiter:
     """Test the Waiter class."""
 
