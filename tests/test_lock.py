@@ -56,6 +56,7 @@ import pytest
 from botocore.exceptions import ClientError
 from botocore.response import StreamingBody
 from botocore.stub import ANY, Stubber
+from filelock import FileLock as LocalFileLock
 
 import mx8fs.lock as lock_module
 from mx8fs import FileLock, Waiter, delete_file, read_file, write_file
@@ -319,6 +320,19 @@ def test_local_claim_is_atomic_when_contender_pauses(tmp_path: Path) -> None:
         finally:
             resume.set()
         future.result(timeout=10)
+    with FileLock(file, time_out_seconds=1):
+        pass
+
+
+def test_local_release_preserves_claim_while_guard_is_busy(tmp_path: Path) -> None:
+    file = str(tmp_path / "resource")
+    with FileLock(file, wait_period=0, time_out_seconds=0) as lock:
+        claim = read_file(f"{file}.lock")
+        with LocalFileLock(f"{file}.lock.guard"):
+            with pytest.raises(TimeoutError):
+                lock.__exit__()
+            assert read_file(f"{file}.lock") == claim
+    assert not Path(f"{file}.lock").exists()
     with FileLock(file, time_out_seconds=1):
         pass
 
