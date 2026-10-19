@@ -35,19 +35,35 @@ Copyright (c) 2024-2025 MX8 Inc, all rights reserved.
 
 """
 
+import json
 import logging
-import string
-from datetime import datetime, timedelta
-from functools import cached_property
-from random import choice
+import os
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from datetime import timedelta
+from math import isfinite
 from time import sleep, time
-from typing import Any
+from typing import Any, cast
+from uuid import uuid4
 
-from mx8fs import delete_file, list_files, write_file
+from botocore.exceptions import ClientError
+from filelock import FileLock as LocalFileLock
+from filelock import Timeout as LocalLockTimeout
+
+from .file_io import _atomic_write_bytes, get_bucket_key, read_file_with_version, s3_client
 
 logger = logging.getLogger("mx8.lock")
 
 TIME_FORMAT = "%Y%m%d%H%M%S"
+
+
+@dataclass(frozen=True)
+class _LockRecord:
+    """One claim record together with the storage version returned by that read."""
+
+    claim_id: str
+    created_at: float
+    version: str
 
 
 class Waiter:
@@ -115,116 +131,186 @@ class Waiter:
             raise TimeoutError("Timed out waiting for completion")
 
 
+@dataclass(frozen=True)
+class _LockClaim:
+    """Identify one successful acquisition and, on S3, its ETag."""
+
+    claim_id: str
+    etag: str | None = None
+
+
+class BaseLock(ABC):
+    """Share polling, claim lifecycle and record encoding between backends."""
+
+    def __init__(self, file: str):
+        """Set the shared record path and begin without an acquired claim."""
+        self._lock_file = f"{file}.lock"
+        self._claim: _LockClaim | None = None
+
+    def acquire(self, waiter: Waiter, maximum_age: timedelta) -> None:
+        """Keep trying until storage accepts the claim or the wait times out."""
+        claim_id = uuid4().hex
+        waiter.start_timeout()
+        while (claim := self._try_acquire(claim_id, maximum_age)) is None:
+            waiter.check_timeout()
+        # A failed acquisition leaves any previously held claim intact.
+        self._claim = claim
+
+    def release(self, waiter: Waiter) -> None:
+        """Release the acquired claim, or finish if it has already been replaced."""
+        waiter.start_timeout()
+        claim = self._claim
+        if claim is None:
+            return
+        while not self._try_release(claim):
+            waiter.check_timeout()
+        self._claim = None
+
+    @abstractmethod
+    def _try_acquire(self, claim_id: str, maximum_age: timedelta) -> _LockClaim | None:
+        """Return a successful atomic claim, or None when another claim wins."""
+
+    @abstractmethod
+    def _try_release(self, claim: _LockClaim) -> bool:
+        """Return True when this claim is removed, absent or superseded."""
+
+    def _read_lock(self) -> _LockRecord | None:
+        """Read the claim record and its storage version together."""
+        try:
+            contents, version = read_file_with_version(self._lock_file)
+        except FileNotFoundError:
+            return None
+        record = json.loads(contents)
+        # Retain the stored "owner" field for compatibility; it identifies a claim, not a user.
+        claim_id, created_at = record["owner"], record["created_at"]
+        if not isinstance(claim_id, str) or not isinstance(created_at, (int, float)) or not isfinite(created_at):
+            raise ValueError(f"Invalid lock record: {self._lock_file}")
+        return _LockRecord(claim_id, created_at, version)
+
+    @staticmethod
+    def _is_unexpired(record: _LockRecord, maximum_age: timedelta) -> bool:
+        """Apply the contender's maximum-age policy."""
+        return time() < record.created_at + maximum_age.total_seconds()
+
+    @staticmethod
+    def _encode_claim_record(claim_id: str) -> bytes:
+        """Keep the claim UUID in the content so successive S3 claims have distinct ETags."""
+        return json.dumps({"owner": claim_id, "created_at": time()}).encode("utf-8")
+
+
+class _LocalLock(BaseLock):
+    """Protect each claim-record read/check/change with a short OS-backed guard."""
+
+    def __init__(self, file: str):
+        super().__init__(file)
+        # Keep the guard separate: replacing the claim record must not replace the guarded inode.
+        self._guard = LocalFileLock(f"{self._lock_file}.guard")
+
+    def _try_acquire(self, claim_id: str, maximum_age: timedelta) -> _LockClaim | None:
+        try:
+            with self._guard.acquire(timeout=0):
+                current = self._read_lock()
+                if current is not None and self._is_unexpired(current, maximum_age):
+                    return None
+                _atomic_write_bytes(os.path.abspath(self._lock_file), self._encode_claim_record(claim_id))
+                return _LockClaim(claim_id=claim_id)
+        except LocalLockTimeout:
+            return None
+
+    def _try_release(self, claim: _LockClaim) -> bool:
+        try:
+            with self._guard.acquire(timeout=0):
+                current = self._read_lock()
+                if current is not None and current.claim_id == claim.claim_id:
+                    os.remove(self._lock_file)
+                return True
+        except LocalLockTimeout:
+            return False
+
+
+class _S3Lock(BaseLock):
+    """Let S3 conditional PUT and DELETE operations arbitrate claims on one fixed key."""
+
+    def __init__(self, file: str):
+        super().__init__(file)
+        self._bucket, self._key = get_bucket_key(self._lock_file)
+
+    def _try_acquire(self, claim_id: str, maximum_age: timedelta) -> _LockClaim | None:
+        current = self._read_lock()
+        if current is not None and self._is_unexpired(current, maximum_age):
+            if current.claim_id == claim_id:
+                # A retried PUT may report contention after its first attempt succeeded.
+                return _LockClaim(claim_id=claim_id, etag=current.version)
+            return None
+        try:
+            if current is None:
+                # Create only if the key is still absent when S3 commits the PUT.
+                response = s3_client.put_object(
+                    Bucket=self._bucket,
+                    Key=self._key,
+                    Body=self._encode_claim_record(claim_id),
+                    IfNoneMatch="*",
+                )
+            else:
+                # Replace this expired version only; any newer claim makes the condition fail.
+                response = s3_client.put_object(
+                    Bucket=self._bucket,
+                    Key=self._key,
+                    Body=self._encode_claim_record(claim_id),
+                    IfMatch=current.version,
+                )
+        except ClientError as error:
+            if error.response["ResponseMetadata"]["HTTPStatusCode"] in {409, 412}:
+                return None
+            if error.response["Error"]["Code"] == "NoSuchKey":
+                return None
+            raise
+        return _LockClaim(claim_id=claim_id, etag=response["ETag"])
+
+    def _try_release(self, claim: _LockClaim) -> bool:
+        try:
+            # Retain our acquired ETag; a fresh read could authorize deleting a successor.
+            s3_client.delete_object(Bucket=self._bucket, Key=self._key, IfMatch=cast(str, claim.etag))
+        except ClientError as error:
+            status = error.response["ResponseMetadata"]["HTTPStatusCode"]
+            if status == 409:
+                return False
+            if status != 412 and error.response["Error"]["Code"] != "NoSuchKey":
+                raise
+        return True
+
+
 class FileLock:
     """
-    Implements locking using an additional file on the file system.
+    Acquire an expiring local or S3 lock through a backend selected at construction.
 
-    For file systems that are only eventually consistent, use a longer
-    wait_period to wait for consistency when multiple clients are reading at the same time.
-
-    Locks a file across multiple process and clients using an additional file on the file system.
-
-    The lock file has the following format:
-    "{file}.{timestamp}.{random}.lock"
-
-    where:
-
-    * file - is the file being locked
-    * timestamp - is the timestamp the lock was requested in the format %Y%m%d%H%M%S
-    * random - is a random set of letters
-
-    On creating the lock we
-
-    1. Check to see if anyone already has a lock
-    2. If they don't, attempt to create a lock and wait for wait_period.
-    3. If two processes have attempted to get the lock then the one with the earlier lock gets it.
-    4. When the lock is released the lock class deletes the lock and other processes can proceed
-
-    Locks only last for maximum_age seconds, and any request will time out after time_out_seconds
+    The constructor and context-manager API are shared by both backends.
+    Each contender respects its own maximum_age. Expiry permits takeover without
+    stopping the old holder; release cannot remove a successor's claim.
+    All participating clients must use this claim-record protocol.
     """
 
     def __init__(
         self,
         file: str,
         wait_period: float = 0.1,
-        time_out_seconds: int = 840,  # 1 minute less than the lambda timeout
-        maximum_age: int = 900,  # 15 minutes, the maximum time a lambda can run
+        time_out_seconds: int = 840,
+        maximum_age: int = 900,
     ):
-        """
-        Initialize the lock.
-
-        Args:
-            file: The file to lock.
-            wait_period: The period to wait before confirming file lock.
-            time_out_seconds: The time out to stop waiting after.
-            maximum_age: The maximum age of lock files to respect.
-
-        """
+        """Select the storage backend and preserve the existing polling and expiry options."""
         self.file = file
         self.waiter = Waiter(wait_period, time_out_seconds)
         self.maximum_age = timedelta(seconds=maximum_age)
-
-    @cached_property
-    def _lock_file(self) -> str:
-        """Get the lock file name."""
-        timestamp = datetime.now().strftime(TIME_FORMAT)
-        random_key = "".join(choice(string.ascii_lowercase) for _ in range(12))  # nosec - insecure random number
-
-        return f"{self.file}.{timestamp}.{random_key}.lock"
+        self._backend: BaseLock = _S3Lock(file) if file.startswith("s3://") else _LocalLock(file)
 
     def __enter__(self) -> "FileLock":
-        """Acquire the lock on the file. This will wait until the lock is available."""
+        """Wait for the selected backend to acquire the lock."""
         logger.debug("Getting lock on %s", self.file)
-
-        # If the file is locked then wait for it to be unlocked
-        self.waiter.start_timeout()
-        while len(self._get_lock_files()) > 0:
-            self.waiter.check_timeout()
-
-        # create a lock file
-        write_file(self._lock_file, "locked")
-
-        # Check an wait in case another process is trying to get the lock
-        self.waiter.wait()
-        while (
-            len(lock_files := self._get_lock_files()) > 1 and lock_files[0] != self._lock_file
-        ):  # pragma: no cover - coverage is not collected for multi-process tests
-            try:
-                self.waiter.check_timeout()
-            except TimeoutError as ex:
-                delete_file(self._lock_file)
-                raise ex
-
+        self._backend.acquire(self.waiter, self.maximum_age)
         logger.debug("Acquired lock on %s", self.file)
         return self
 
     def __exit__(self, *_: list[Any], **__: dict[str, Any]) -> None:
-        """Release the lock on the file."""
-        delete_file(self._lock_file)
+        """Ask the same backend to release its acquired claim."""
+        self._backend.release(self.waiter)
         logger.debug("Released lock on %s", self.file)
-
-    def _get_lock_files(self) -> list[str]:
-        """Get all the lock files for the current file."""
-        path = "/".join(self.file.split("/")[:-1])
-        prefix = self.file.split("/")[-1]
-
-        # Get all the lock files in the same directory
-        files = [f"{path}/{file}.lock" for file in list_files(path, "lock", prefix)]
-
-        # Return the sorted current lock files for the current file
-        return sorted(file for file in files if self._lock_is_current(file))
-
-    def _lock_is_current(self, lock_file: str) -> bool:
-        """Check if the lock file is current."""
-        # If the lock file is not for the current file then it is not current
-        if self.file not in lock_file:
-            return False
-
-        # If we cannot parse the timestamp then it is not current
-        try:
-            timestamp = datetime.strptime(lock_file.split(".")[-3], TIME_FORMAT)
-        except (IndexError, ValueError):
-            return False
-
-        # If we are less than the maximum age then it is current
-        return datetime.now() < timestamp + self.maximum_age

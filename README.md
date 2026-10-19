@@ -7,6 +7,39 @@ This library provides environment agnostic file system access across local and A
 - Caching
 - Comparing Dictionaries
 
+## 2.0.0 breaking change
+
+`FileLock` now uses one `{file}.lock` claim record instead of
+`{file}.{timestamp}.{random}.lock` candidate files. S3 conditional writes and deletes,
+and a local OS-backed guard, prevent a delayed contender from acquiring a lock that
+another client already holds. Local locking also retains a `{file}.lock.guard` file
+for synchronization; keep that file in place while clients are running.
+
+`filelock` is pinned to 3.20.3 to preserve the Unix guard inode across operations.
+Do not override this dependency: mixing guard lifecycles can allow overlapping
+locks even when every client runs mx8fs 2.x.
+
+**1.x and 2.x clients must not acquire locks for the same resource concurrently.**
+The new protocol does not inspect legacy candidate files, so clients using different
+protocols can enter the same critical section.
+
+To upgrade, or to roll back across this boundary:
+
+1. Stop new lock acquisitions and let existing critical sections finish, or stop
+   the processes holding those locks. Waiting for `maximum_age` alone does not stop
+   a process that is still running.
+2. Upgrade every client that can lock the same resource before restarting them.
+   Include API processes, background workers, Lambda variants and running container
+   tasks, even when they come from the same repository. For a rollback, return all
+   of those clients to the previous protocol before restarting them.
+3. Resume lock acquisitions after all participants use the same protocol. Orphaned
+   legacy candidate files may be removed once their old clients have stopped;
+   2.x ignores them.
+
+The constructor, context-manager API and defaults are unchanged. `maximum_age`
+remains the checker's policy for the age of existing locks; the creator does not
+set an expiry deadline for other clients.
+
 ## API Reference
 
 Below are the functions and classes exported by the library (`mx8fs.__all__`). Paths can be local (e.g. `/tmp/file.txt`) or S3 (`s3://bucket/key`). HTTPS reads are supported in specific helpers.
@@ -262,8 +295,9 @@ current state is captured before the next mx8fs mutation.
   ```
 
 - `class FileLock(file: str, wait_period: float = 0.1, time_out_seconds: int = 840, maximum_age: int = 900)`: Cross‑process/client lock via lock files.
-  - Creates lock files named `{file}.{timestamp}.{random}.lock` and coordinates access; cleans up on exit.
-  - Use a higher `wait_period` for eventually‑consistent backends.
+  - Uses one `{file}.lock` claim record. S3 acquisition, expired-record takeover and release use conditional object operations. Local state changes use an OS-backed guard and atomic file replacement; the local `{file}.lock.guard` file is retained for synchronization.
+  - `wait_period` controls polling after contention. Each contender respects records younger than its own `maximum_age`; expiry does not stop a previous holder from executing, but that holder cannot release its successor's lock.
+  - Follow the [2.0.0 migration instructions](#200-breaking-change) before upgrading or rolling back clients that lock the same resource.
   - Usage:
   ```python
   from mx8fs import FileLock, write_file
