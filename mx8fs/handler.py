@@ -241,8 +241,7 @@ class FileHandler[ContentT]:
             if expected_version is None or self.compression is None or isinstance(error, VersionMismatchError):
                 raise
             raise VersionMismatchError(f"File {self.path} changed before its conditional update") from error
-        assert handler.version is not None
-        self.version = self._version_token(handler.version, compressed)
+        self.version = self._version_token(cast(str, handler.version), compressed)
         if expected_version is None and self.fallback_uncompressed:
             BinaryFileHandler.delete(self.path)
         return self.version

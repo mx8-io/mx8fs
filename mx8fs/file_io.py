@@ -1158,19 +1158,18 @@ class BinaryFileHandler:
                 raise FileNotFoundError(f"File {self.path} not found") from exc
             self._buffer.seek(0)
 
-    def _set_buffer_local_version(self) -> None:
+    def _set_buffer_local_version(self, version_id: str) -> None:
         """Read immutable sidecar bytes using known metadata when available."""
-        assert self.version_id is not None
-        metadata = self._version_metadata or _load_local_version(self.path, self.version_id)
+        metadata = self._version_metadata or _load_local_version(self.path, version_id)
         if metadata.is_deleted:
-            raise FileVersionDeletedError(f"Version {self.version_id} of {self.path} is a delete marker")
+            raise FileVersionDeletedError(f"Version {version_id} of {self.path} is a delete marker")
         history_path = _require_local_history_path(self.path)
-        data_path = os.path.join(history_path, "versions", f"{self.version_id}.data")
+        data_path = os.path.join(history_path, "versions", f"{version_id}.data")
         try:
             with open(data_path, "rb") as source:
                 self._buffer.write(source.read())
         except FileNotFoundError as error:  # pragma: no cover - corrupt sidecar
-            raise VersionNotFoundError(f"Version {self.version_id} of {self.path} not found") from error
+            raise VersionNotFoundError(f"Version {version_id} of {self.path} not found") from error
         self.version = metadata.revision or metadata.version_id
         self._buffer.seek(0)
 
@@ -1185,7 +1184,7 @@ class BinaryFileHandler:
         elif self.is_s3:
             self._set_buffer_s3()
         elif self.version_id is not None:
-            self._set_buffer_local_version()
+            self._set_buffer_local_version(self.version_id)
         return self._buffer
 
     def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
