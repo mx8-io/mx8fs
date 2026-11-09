@@ -6,17 +6,13 @@ import logging
 import os
 import threading
 from collections.abc import Callable
+from contextlib import ExitStack
 from typing import Any, cast
 
 from pydantic import ValidationError
 from sqlalchemy import create_engine, event
 from sqlalchemy.engine import Engine
 
-from .file_io import (
-    _get_file_version,
-    _list_current_file_versions,
-    read_file_with_version,
-)
 from .index import (
     IndexManager,
     IndexRebuildResult,
@@ -152,25 +148,27 @@ class IndexedJsonFileStorage[ModelT](JsonFileStorage[ModelT]):
         self._index_ready = True
 
     def _read_rebuild_key(self, key: str) -> tuple[str, dict[str, Any] | None, str | None]:
-        try:
-            contents, version = read_file_with_version(self._get_path(key))
-        except FileNotFoundError:
-            return key, None, None
-        try:
-            model = self._json_to_model(contents)
-        except ValidationError as error:
-            logger.error(
-                "Skipping malformed JSON object key %s during index reconciliation: %s",
-                key,
-                error,
-            )
-            return key, None, version
+        with ExitStack() as contexts:
+            try:
+                reader = contexts.enter_context(self._file(key).open_read())
+                version = reader.version
+            except FileNotFoundError:
+                return key, None, None
+            try:
+                model = reader.read()
+            except ValidationError as error:
+                logger.error(
+                    "Skipping malformed JSON object key %s during index reconciliation: %s",
+                    key,
+                    error,
+                )
+                return key, None, version
         return key, self.index.values_for(model, self._namespace, version), version
 
     def _reconcile_index(self, lease: Any, max_workers: int | None = None) -> IndexRebuildResult:
         initial_indexed_keys = self._index_manager.indexed_keys()
         workers = _DEFAULT_REBUILD_WORKERS if max_workers is None else max_workers
-        listed_versions = _list_current_file_versions(self.base_path, self._extension)
+        listed_versions = self._listed_versions()
         results = _parallel_map(
             self._read_rebuild_key,
             sorted(listed_versions),
@@ -184,7 +182,7 @@ class IndexedJsonFileStorage[ModelT](JsonFileStorage[ModelT]):
         lease.maybe_renew()
 
         for _ in range(_MAX_VERSION_ATTEMPTS):
-            current_versions = _list_current_file_versions(self.base_path, self._extension)
+            current_versions = self._listed_versions()
             if current_versions == observed_versions:
                 return IndexRebuildResult(
                     upserted=len(indexed_keys),
@@ -221,6 +219,9 @@ class IndexedJsonFileStorage[ModelT](JsonFileStorage[ModelT]):
             self._index_manager.upsert_projections(changed_projections)
             lease.maybe_renew()
         raise IndexUpdateError(f"JSON changed repeatedly while rebuilding index namespace {self._namespace}")
+
+    def _listed_versions(self) -> dict[str, str]:
+        return {item.name: item.version for item in self.list_with_metadata()}
 
     def rebuild_index(self, max_workers: int | None = None) -> IndexRebuildResult:
         """Fully reconcile this JSON namespace with its SQL index."""
@@ -290,27 +291,26 @@ class IndexedJsonFileStorage[ModelT](JsonFileStorage[ModelT]):
         """Index a known write and reread only when a concurrent change occurred."""
         self._index_manager.upsert(model, version)
         try:
-            if _get_file_version(self._get_path(key)) == version:
+            if self._current_version(key) == version:
                 return
         except FileNotFoundError:
             pass
         self._synchronize_key(key)
 
     def _synchronize_key(self, key: str) -> None:
-        path = self._get_path(key)
         for _ in range(_MAX_VERSION_ATTEMPTS):
             try:
                 model, version = self.read_with_version(key)
             except FileNotFoundError:
                 self._index_manager.delete(key)
                 try:
-                    _get_file_version(path)
+                    self._current_version(key)
                 except FileNotFoundError:
                     return
                 continue
             self._index_manager.upsert(model, version)
             try:
-                current_version = _get_file_version(path)
+                current_version = self._current_version(key)
             except FileNotFoundError:
                 continue
             if current_version == version:
@@ -325,3 +325,13 @@ class IndexedJsonFileStorage[ModelT](JsonFileStorage[ModelT]):
             self._synchronize_key(key)
         except Exception as error:
             raise IndexUpdateError(f"JSON was deleted but index synchronization failed for key {key}") from error
+
+    def undelete(self, key: str) -> ModelT:
+        """Restore canonical content and synchronize its SQL projection."""
+        self._ensure_index()
+        content = super().undelete(key)
+        try:
+            self._synchronize_key(key)
+        except Exception as error:
+            raise IndexUpdateError(f"JSON was restored but index synchronization failed for key {key}") from error
+        return content

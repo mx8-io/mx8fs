@@ -281,6 +281,114 @@ current state is captured before the next mx8fs mutation.
       blob = f.read()
   ```
 
+Both handlers accept keyword-only `versioned=False`, `version_id=None` and `expected_version=None`.
+Use `versioned=True` to track the current read or successful write in `handler.version`. Historical
+`version_id` reads and conditional `expected_version` writes enable version tracking automatically.
+`version_id` also accepts a listed `FileVersionMetadata` object to reuse its metadata without another lookup.
+The revision is the S3 ETag or local nanosecond mtime; HTTPS current reads have no revision.
+
+```python
+handler = GzipFileHandler(path, "rt", encoding="utf-8", versioned=True)
+with handler as source:
+    text = source.read()
+
+writer = GzipFileHandler(path, "wt", encoding="utf-8", expected_version=handler.version)
+with writer as destination:
+    destination.write(text)
+new_version = writer.version
+```
+
+Versioned writes buffer until successful context exit. Gzip finishes before the underlying binary handler
+publishes, so a body or compression-finalization failure leaves the destination untouched. Local versioned
+writes preserve local history and publish with atomic replacement. Conditional writes use the existing
+mtime checks locally and S3 `IfMatch`; local compare-and-replace retains the concurrency limitation described
+above. Versioned S3 writes use `PutObject` and its single-request size limit; default stream writes retain
+managed uploads. `GzipFileHandler` also accepts `compression_level=9` (0–9), preserving its existing default.
+
+`JsonFileHandler(path, mode="r", *, compression=None, compression_level=1, version_id=None,
+expected_version=None, decoder=json.loads, encoder=json.dumps)` wraps these handlers for JSON documents.
+It supports `r` and `w`, returns itself from the context, and exposes `read()`, `write(value)` and `.version`.
+Compression accepts `None` or `"gzip"`; the supplied path is used unchanged. JSON I/O always enables version
+tracking and successful-exit publication, including when compression is disabled. Historical version IDs
+and listed `FileVersionMetadata` objects work in the same way as the binary and gzip handlers.
+
+```python
+from mx8fs import JsonFileHandler
+
+reader = JsonFileHandler("/tmp/settings.json.gz", compression="gzip")
+with reader as source:
+    settings = source.read()
+
+with JsonFileHandler(
+    "/tmp/settings.json.gz", "w", compression="gzip", expected_version=reader.version
+) as destination:
+    destination.write(settings)
+new_version = destination.version
+```
+
+The decoder receives UTF-8 JSON text; the encoder returns JSON text. Supplying model conversion functions
+preserves custom validation and serialization without adding a Pydantic dependency to the handler.
+`JsonFileStorage` supplies its existing model hooks through `FileHandler`, which owns logical filename
+selection, fallback, history and version routing. The storage classes do not implement those file policies.
+
+`TextFileHandler(path, mode="r", *, encoding="utf-8", newline="auto", compression=None, compression_level=1,
+version_id=None, expected_version=None)` owns text conversion. Its `read(size=-1)` and `write(text)` methods
+use `TextIOWrapper` for encoding and newline handling. It returns itself from its context and exposes
+`.version`. Text is flushed before gzip finalization and binary publication. `JsonFileHandler` delegates
+text I/O to this handler, preserving JSON text without newline translation.
+
+The default `newline="auto"` preserves the existing text-read behaviour: local reads normalize
+line endings to `\n`, while S3 and HTTPS preserve their original line endings. Explicit `newline=None`
+normalizes on every backend; `newline=""` preserves line endings on every backend. The text handler
+owns this policy, including reads through the legacy helpers.
+
+### Typed file operations
+
+`FileHandler(path, data_type, *, compression=None, compression_level=1, fallback_uncompressed=False,
+encoding="utf-8", newline="auto", decoder=None, encoder=None)` is the complete logical-file API.
+Use `bytes` for binary data, `str` for text, and JSON types such as `dict` or `list` for JSON values.
+Pydantic model types use their JSON validation and serialization methods; custom codecs can override them
+without adding a Pydantic dependency to the handler.
+
+The path is logical: `FileHandler("/tmp/settings.json", dict, compression="gzip")` writes
+`/tmp/settings.json.gz`. `primary_path` exposes that physical destination. Low-level binary, gzip, text and
+JSON stream handlers continue to use their supplied physical paths unchanged.
+
+```python
+from mx8fs import FileHandler
+
+file = FileHandler("/tmp/settings.json", data_type=dict, compression="gzip", fallback_uncompressed=True)
+settings, revision = file.read_with_version()
+file.write(settings, expected_version=revision)
+metadata = file.metadata()
+versions = file.history()
+old_settings = file.read(version_id=versions[-1])
+
+folder = FileHandler("/tmp", data_type=dict, compression="gzip", fallback_uncompressed=True)
+keys = folder.list("json")
+files = folder.list_with_metadata("json", include_deleted=True)
+child = folder.joinpath("settings.json")
+```
+
+The handler provides `read(version_id=None)`, `read_with_version(version_id=None)`,
+`write(value, expected_version=None)`, `exists()`, `delete()`, `current_version()`,
+`metadata(include_deleted=False)`, `history()`, `restore_version(version_id)`, `undelete()` and `get_lock()`.
+Version IDs are keyword-only on reads and accept historical ID strings or listed `FileVersionMetadata`.
+`write()` returns the published revision; `.version` records the revision of the last opened or published
+content. HTTPS supports current reads and existence checks, without concurrency versions or portable metadata.
+
+Directory listings accept `prefix=""` and return extension-free logical keys. The prefix is passed to
+the backend to limit S3 listing work. Single-file metadata uses the logical filename,
+including its data extension. Gzip/plain listings and history are merged by the handler, with opaque
+source-aware tokens. Fallback happens only while opening an absent file or historical version, before
+JSON or model decoding. Normal gzip writes publish before retiring plain current files; conditional
+updates retain the representation that was read.
+
+`open_read()` yields a `FileReader` containing a deferred `read()` and the revision of those exact bytes.
+Indexed storage uses it to retain the source revision even when model validation fails. File metadata,
+version parsing and backend operations remain inside the handler; storage owns keys and models, while
+indexed storage owns SQL projections and reconciliation.
+
 ### Locking
 
 - `class Waiter(wait_period: float, time_out_seconds: float)`: Helper for periodic waits with a timeout.
@@ -378,6 +486,47 @@ Install JSON storage dependencies with `pip install "mx8fs[json-storage]"`.
   all_keys = store.list()
   store.delete(u.key)
   ```
+
+Optional gzip storage reuses these handlers:
+
+```python
+UserStorage = json_file_storage_factory(
+    extension="json", model=User, key_field="key",
+    compression="gzip", compression_level=1, fallback_uncompressed=True,
+)
+```
+
+The factory configures `FileHandler` for compression and fallback, using the same `JsonFileStorage` class
+with or without gzip. Indexed storage uses that same handler API. Its read fallback catches
+`FileNotFoundError` while opening gzip and then opens the uncompressed filename; decoding and validation
+failures propagate. A separate gzip storage subclass is not required.
+
+Defaults remain uncompressed, with plain fallback disabled. Gzip mode appends `.gz` to the extension and
+uses compression level 1 unless configured otherwise. With `fallback_uncompressed=True`, reads prefer gzip
+and fall back only on absence; corrupt gzip, invalid JSON and permission errors propagate. Listings
+deduplicate logical keys, key allocation checks both names, and deletion removes both current representations.
+Normal writes finish publishing gzip before deleting the plain current object.
+
+Local Unix file modes are not configurable through the storage API. Creating a gzip destination uses
+normal creation permissions and the process umask; it does not inherit the plain file's mode. Under
+umask `022`, migrating a `0600` plain file can therefore create a `0644` gzip file. Use a restrictive
+process umask when creating private local records. An existing gzip destination retains its own mode.
+
+Gzip-mode concurrency tokens identify the representation with `gzip:` or `plain:`. Pass them unchanged to
+`update_if_version()`. Conditional mutations retain the representation read: a plain mutation stays plain
+until a normal save. A concurrent gzip publication causes a plain mutation to report a version conflict so
+`mutate()` can reread and recompute. Normal saves and deletes are not cross-object transactions; coordinate
+them with `get_lock()` when the application needs serialization.
+
+Locks use the logical filename so plain and gzip callers serialize access to the same record.
+With local history enabled, migration captures the plain state before publishing gzip so recovery
+selects the newly saved value.
+
+History combines both filenames and supplies tagged `version_id` values for `read_version()` and
+`restore_version()`. Deleted listing metadata includes a tagged `latest_readable_version` when available.
+Existing untagged historical IDs are accepted, trying gzip then plain only if that version is absent.
+Restoring or undeleting writes a new gzip current version. Indexed storage supports the same factory options;
+run `rebuild_index()` when switching an existing indexed namespace to gzip to refresh its source versions.
 
 ### Indexed JSON Storage
 

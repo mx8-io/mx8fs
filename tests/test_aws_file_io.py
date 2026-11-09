@@ -61,8 +61,6 @@ from mx8fs import (
     write_file,
 )
 from mx8fs.file_io import (
-    _get_file_version,
-    _list_current_file_versions,
     get_bucket_key,
     get_files,
     purge_folder,
@@ -78,7 +76,7 @@ def _test_read_file(file: str) -> None:
     with pytest.raises(FileNotFoundError):
         read_file(file)
     with pytest.raises(FileNotFoundError):
-        _get_file_version(file)
+        BinaryFileHandler.current_version(file)
 
 
 def _test_read_binary_file(file: str) -> None:
@@ -142,9 +140,9 @@ def _test_list_files(path: str) -> None:
     ignored_file = os.path.join(path, "ignored.json")
     write_file(ignored_file, "ignored")
 
-    versions = _list_current_file_versions(path, "txt")
+    versions = {file.name: file.version for file in BinaryFileHandler.list_files_with_metadata(path, "txt")}
     assert set(versions) == {"test1", "test2"}
-    assert versions["test1"] == _get_file_version(os.path.join(path, TEST_FILE_1))
+    assert versions["test1"] == BinaryFileHandler.current_version(os.path.join(path, TEST_FILE_1))
 
     metadata = sorted(list_files_with_metadata(path, "txt"), key=lambda file: file.name)
     assert [file.name for file in metadata] == ["test1", "test2"]
@@ -339,7 +337,7 @@ def test_local_version_history_errors(tmp_path: Path, monkeypatch: pytest.Monkey
         is_deleted=True,
         revision=None,
     )
-    monkeypatch.setattr("mx8fs.file_io.list_file_versions", lambda _: [deleted])
+    monkeypatch.setattr("mx8fs.file_io.BinaryFileHandler.history", lambda _: [deleted])
     with pytest.raises(FileNotFoundError, match="no recoverable versions"):
         undelete_file(file)
     no_current = FileVersionMetadata(
@@ -351,7 +349,7 @@ def test_local_version_history_errors(tmp_path: Path, monkeypatch: pytest.Monkey
         is_deleted=True,
         revision=None,
     )
-    monkeypatch.setattr("mx8fs.file_io.list_file_versions", lambda _: [no_current])
+    monkeypatch.setattr("mx8fs.file_io.BinaryFileHandler.history", lambda _: [no_current])
     with pytest.raises(FileNotFoundError, match="no current version"):
         undelete_file(file)
 
@@ -388,14 +386,16 @@ def test_version_selection_uses_explicit_metadata(tmp_path: Path, monkeypatch: p
         revision="etag",
     )
 
-    monkeypatch.setattr("mx8fs.file_io._list_versions", lambda *_args, **_kwargs: [recoverable, deleted])
+    monkeypatch.setattr(
+        "mx8fs.file_io.BinaryFileHandler._list_versions", lambda *_args, **_kwargs: [recoverable, deleted]
+    )
     assert list_files_with_metadata(str(tmp_path), "txt", include_deleted=True)[0].is_deleted
 
-    monkeypatch.setattr("mx8fs.file_io.list_file_versions", lambda _: [stale, deleted, recoverable])
-    monkeypatch.setattr("mx8fs.file_io._version_metadata", lambda *_: recoverable)
-    monkeypatch.setattr("mx8fs.file_io._current_version_metadata", lambda _: deleted)
-    monkeypatch.setattr("mx8fs.file_io.read_file_version", lambda *_args, **_kwargs: "old")
-    monkeypatch.setattr("mx8fs.file_io.write_file", lambda *_args, **_kwargs: "new")
+    monkeypatch.setattr("mx8fs.file_io.BinaryFileHandler.history", lambda _: [stale, deleted, recoverable])
+    monkeypatch.setattr("mx8fs.file_io._load_local_version", lambda *_: recoverable)
+    monkeypatch.setattr("mx8fs.file_io.BinaryFileHandler.version_metadata", lambda _: deleted)
+    monkeypatch.setattr(BinaryFileHandler, "__enter__", lambda _: BytesIO(b"old"))
+    monkeypatch.setattr("mx8fs.file_io.BinaryFileHandler.publish", lambda *_args, **_kwargs: "new")
     assert restore_file_version(file, "recoverable") == deleted
 
     restored: list[str] = []
@@ -404,7 +404,7 @@ def test_version_selection_uses_explicit_metadata(tmp_path: Path, monkeypatch: p
         restored.append(version.version_id)
         return deleted
 
-    monkeypatch.setattr("mx8fs.file_io._restore_file_version", restore)
+    monkeypatch.setattr("mx8fs.file_io.BinaryFileHandler._restore_known_version", restore)
     undelete_file(file)
     assert restored == ["recoverable"]
 
@@ -469,7 +469,7 @@ def test_s3_version_lookup_propagates_unexpected_errors(monkeypatch: pytest.Monk
     monkeypatch.setattr(s3_client, "head_object", access_denied)
 
     with pytest.raises(ClientError, match="AccessDenied"):
-        _get_file_version("s3://bucket/key")
+        BinaryFileHandler.current_version("s3://bucket/key")
 
 
 def test_s3_version_history_and_deleted_listing(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -27,13 +27,14 @@ import pytest
 from pydantic import BaseModel
 
 from mx8fs import (
+    BinaryFileHandler,
+    FileHandler,
     FileLock,
     FileNotDeletedError,
     JsonFileStorage,
     VersionMismatchError,
     json_file_storage_factory,
 )
-from mx8fs import storage as storage_module
 
 
 class StorageTestClass(BaseModel):
@@ -102,8 +103,12 @@ def test_undelete_errors(file_storage: JsonFileStorage, monkeypatch: pytest.Monk
 
 def test_undelete_delegates_to_backend(file_storage: JsonFileStorage, monkeypatch: pytest.MonkeyPatch) -> None:
     paths: list[str] = []
-    monkeypatch.setattr(storage_module, "undelete_file", lambda path: paths.append(path))
-    monkeypatch.setattr(file_storage, "read", lambda key: StorageTestClass(value=key))
+
+    def restore(handler: FileHandler[Any]) -> StorageTestClass:
+        paths.append(handler.primary_path)
+        return StorageTestClass(value="file")
+
+    monkeypatch.setattr(FileHandler, "undelete", restore)
 
     assert file_storage.undelete("file").value == "file"
     assert paths == [file_storage._get_path("file")]
@@ -128,18 +133,26 @@ def test_read_and_update_with_version(file_storage: JsonFileStorage) -> None:
 
 def test_mutate_retries_version_conflicts(file_storage: JsonFileStorage, monkeypatch: pytest.MonkeyPatch) -> None:
     file_storage.write(StorageTestClass(value="content1"), "file1")
-    real_update = storage_module.update_file_if_version_matches
+    real_publish = BinaryFileHandler.publish
     attempts = 0
 
-    def conflict_once(path: str, data: str, version: str) -> str:
+    def conflict_once(
+        path: str,
+        data: str | bytes,
+        *,
+        expected_version: str | None = None,
+        content_type: str | None = None,
+    ) -> str:
         nonlocal attempts
+        if expected_version is None:
+            return real_publish(path, data, content_type=content_type)
         attempts += 1
         if attempts == 1:
             file_storage.update(StorageTestClass(value="concurrent", key="file1"))
             raise VersionMismatchError("changed")
-        return real_update(path, data, version)
+        return real_publish(path, data, expected_version=expected_version, content_type=content_type)
 
-    monkeypatch.setattr(storage_module, "update_file_if_version_matches", conflict_once)
+    monkeypatch.setattr(BinaryFileHandler, "publish", staticmethod(conflict_once))
 
     result = file_storage.mutate("file1", lambda current: current.model_copy(update={"value": current.value + "!"}))
 
