@@ -32,8 +32,8 @@ from sqlalchemy.exc import DatabaseError
 import mx8fs
 import mx8fs.index as index_module
 import mx8fs.indexed_storage as indexed_storage_module
-import mx8fs.storage as storage_module
 from mx8fs import (
+    BinaryFileHandler,
     IndexedJsonFileStorage,
     IndexUpdateError,
     JsonFileStorage,
@@ -378,7 +378,7 @@ def test_rebuild_reconciles_different_keys_concurrently(tmp_path: Path, monkeypa
         rendezvous.wait(timeout=1)
         return key, projection(storage, record(key, "pending", 1), versions[key]), versions[key]
 
-    monkeypatch.setattr(indexed_storage_module, "_list_current_file_versions", lambda *_: versions)
+    monkeypatch.setattr(storage, "_listed_versions", lambda *_: versions)
     monkeypatch.setattr(storage, "_read_rebuild_key", read_rebuild_key)
 
     assert storage.rebuild_index(max_workers=2) == index_module.IndexRebuildResult(upserted=2, removed=0)
@@ -477,18 +477,26 @@ def test_update_if_version_rejects_stale_content(tmp_path: Path) -> None:
 def test_mutate_rereads_and_recomputes_after_version_conflict(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     storage = make_storage(tmp_path)
     storage.write(record("a", "pending", 1))
-    real_update = storage_module.update_file_if_version_matches
+    real_publish = BinaryFileHandler.publish
     attempts = 0
 
-    def conflict_once(path: str, data: str, version: str) -> str:
+    def conflict_once(
+        path: str,
+        data: str | bytes,
+        *,
+        expected_version: str | None = None,
+        content_type: str | None = None,
+    ) -> str:
         nonlocal attempts
+        if expected_version is None:
+            return real_publish(path, data, content_type=content_type)
         attempts += 1
         if attempts == 1:
             Path(path).write_text(record("a", "concurrent", 2).model_copy(update={"count": 10}).model_dump_json())
             raise VersionMismatchError("changed")
-        return real_update(path, data, version)
+        return real_publish(path, data, expected_version=expected_version, content_type=content_type)
 
-    monkeypatch.setattr(storage_module, "update_file_if_version_matches", conflict_once)
+    monkeypatch.setattr(BinaryFileHandler, "publish", staticmethod(conflict_once))
 
     result = storage.mutate("a", lambda current: current.model_copy(update={"count": current.count + 1}))
 
@@ -509,10 +517,10 @@ def test_mutate_validates_attempts_key_and_exhausted_conflicts(tmp_path: Path, m
     with pytest.raises(ValueError, match="storage key"):
         storage.mutate("a", lambda current: current.model_copy(update={"key": "b"}))
 
-    def conflict(*_: Any) -> str:
+    def conflict(*args: Any, **kwargs: Any) -> str:
         raise VersionMismatchError("changed")
 
-    monkeypatch.setattr(storage_module, "update_file_if_version_matches", conflict)
+    monkeypatch.setattr(BinaryFileHandler, "publish", staticmethod(conflict))
     with pytest.raises(VersionMismatchError, match="all 2"):
         storage.mutate("a", lambda current: current, max_attempts=2)
 
@@ -662,7 +670,7 @@ def test_written_version_missing_during_check_falls_back_to_full_synchronization
     storage = make_storage(tmp_path)
     storage.write(record("a", "pending", 1))
     synchronized: list[str] = []
-    monkeypatch.setattr(indexed_storage_module, "_get_file_version", lambda _: (_ for _ in ()).throw(FileNotFoundError))
+    monkeypatch.setattr(storage, "_current_version", lambda _: (_ for _ in ()).throw(FileNotFoundError))
     monkeypatch.setattr(storage, "_synchronize_key", synchronized.append)
 
     storage._synchronize_written("a", record("a", "done", 2), "written")
@@ -710,10 +718,10 @@ def test_index_synchronization_retries_missing_and_unstable_versions(
             raise FileNotFoundError
         return version
 
-    monkeypatch.setattr(indexed_storage_module, "_get_file_version", version_after_temporary_missing)
+    monkeypatch.setattr(storage, "_current_version", version_after_temporary_missing)
     storage._synchronize_key("a")
 
-    monkeypatch.setattr(indexed_storage_module, "_get_file_version", lambda _: "always-different")
+    monkeypatch.setattr(storage, "_current_version", lambda _: "always-different")
     with pytest.raises(IndexUpdateError, match="changed repeatedly"):
         storage._synchronize_key("a")
 
@@ -980,7 +988,7 @@ def test_rebuild_handles_files_changing_after_listing(tmp_path: Path, monkeypatc
     storage.write(record("current", "pending", 1))
 
     listings = iter([{"current": "old"}, {}])
-    monkeypatch.setattr(indexed_storage_module, "_list_current_file_versions", lambda *_: next(listings))
+    monkeypatch.setattr(storage, "_listed_versions", lambda *_: next(listings))
     monkeypatch.setattr(storage, "_read_rebuild_key", lambda key: (key, None, None))
     result = storage.rebuild_index()
     assert result == index_module.IndexRebuildResult(upserted=0, removed=1)
@@ -988,7 +996,7 @@ def test_rebuild_handles_files_changing_after_listing(tmp_path: Path, monkeypatc
     monkeypatch.undo()
     storage._index_manager.upsert(record("appeared", "done", 2))
     listings = iter([{}, {"appeared": "new"}, {"appeared": "new"}, {"appeared": "new"}])
-    monkeypatch.setattr(indexed_storage_module, "_list_current_file_versions", lambda *_: next(listings))
+    monkeypatch.setattr(storage, "_listed_versions", lambda *_: next(listings))
     monkeypatch.setattr(
         storage,
         "_read_rebuild_key",
@@ -1030,7 +1038,7 @@ def test_rebuild_repairs_only_changed_projection_after_bulk_replace(
         delta_keys.extend(item[storage._key_field] for item in projections)
         real_upsert(projections, **kwargs)
 
-    monkeypatch.setattr(indexed_storage_module, "_list_current_file_versions", lambda *_: next(listings))
+    monkeypatch.setattr(storage, "_listed_versions", lambda *_: next(listings))
     monkeypatch.setattr(storage, "_read_rebuild_key", read_projection)
     monkeypatch.setattr(storage._index_manager, "replace_namespace", replace)
     monkeypatch.setattr(storage._index_manager, "upsert_projections", upsert)
@@ -1069,7 +1077,7 @@ def test_rebuild_delta_handles_disappearing_and_malformed_keys(tmp_path: Path, m
         projected, version = next(reads[key])
         return key, projected, version
 
-    monkeypatch.setattr(indexed_storage_module, "_list_current_file_versions", lambda *_: next(listings))
+    monkeypatch.setattr(storage, "_listed_versions", lambda *_: next(listings))
     monkeypatch.setattr(storage, "_read_rebuild_key", read_projection)
 
     result = storage.rebuild_index(max_workers=1)
@@ -1084,7 +1092,7 @@ def test_rebuild_handles_a_file_disappearing_during_read(tmp_path: Path, monkeyp
     def missing(*_: Any) -> tuple[str, str]:
         raise FileNotFoundError
 
-    monkeypatch.setattr(indexed_storage_module, "read_file_with_version", missing)
+    monkeypatch.setattr(storage, "_file", missing)
 
     assert storage._read_rebuild_key("missing") == ("missing", None, None)
 
@@ -1099,7 +1107,7 @@ def test_rebuild_fails_when_source_versions_never_stabilize(tmp_path: Path, monk
         version += 1
         return {"a": str(version)}
 
-    monkeypatch.setattr(indexed_storage_module, "_list_current_file_versions", changing_versions)
+    monkeypatch.setattr(storage, "_listed_versions", changing_versions)
     monkeypatch.setattr(
         storage,
         "_read_rebuild_key",

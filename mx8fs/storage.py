@@ -25,23 +25,10 @@ import random
 import string
 from collections.abc import Callable
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
-from typing import TYPE_CHECKING, Any, cast, overload
+from typing import TYPE_CHECKING, Any, Literal, cast, overload
 
-from .file_io import (
-    FileMetadata,
-    FileVersionMetadata,
-    VersionMismatchError,
-    delete_file,
-    file_exists,
-    list_file_versions,
-    list_files,
-    list_files_with_metadata,
-    read_file,
-    read_file_with_version,
-    undelete_file,
-    update_file_if_version_matches,
-    write_file,
-)
+from .file_io import FileMetadata, FileVersionMetadata, VersionMismatchError
+from .handler import FileHandler
 from .lock import FileLock
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -93,9 +80,13 @@ def _parallel_map[InputT, OutputT](
 class JsonFileStorage[ModelT]:
     """A storage class for JSON serializable pydantic models."""
 
+    _model: type[Any] = dict
     _extension: str
     _key_field: str
     _randomizer: Callable[[], None] = random.seed
+    _compression: Literal["gzip"] | None = None
+    _compression_level: int = 1
+    _fallback_uncompressed: bool = False
 
     def __init__(self, base_path: str, randomizer: Callable[[], None] | None = None) -> None:
         """Initialize storage with a base path and optional randomizer."""
@@ -105,7 +96,7 @@ class JsonFileStorage[ModelT]:
         if "AWS_LAMBDA_FUNCTION_NAME" in os.environ and self._randomizer == random.seed:
             raise ValueError("Cannot use random.seed as a randomizer in AWS Lambda environment")
 
-        self.randomizer = randomizer or random.seed
+        self.randomizer = self._randomizer
 
     @staticmethod
     def _json_to_model(json: str) -> ModelT:  # pragma: no cover
@@ -129,35 +120,51 @@ class JsonFileStorage[ModelT]:
         )
 
         # If the key already exists, try again
-        if file_exists(self._get_path(key)):
+        if self._key_exists(key):
             return self._get_unique_key(key_length)
 
         return key
 
+    def _files(self) -> FileHandler[ModelT]:
+        return FileHandler(
+            self.base_path,
+            self._model,
+            compression=self._compression,
+            compression_level=self._compression_level,
+            fallback_uncompressed=self._fallback_uncompressed,
+            decoder=self._json_to_model,
+            encoder=self._model_to_json,
+        )
+
+    def _file(self, key: str) -> FileHandler[ModelT]:
+        return self._files().joinpath(f"{key}.{self._extension}")
+
+    def _key_exists(self, key: str) -> bool:
+        return self._file(key).exists()
+
     def list(self, *, include_deleted: bool = False) -> list[str]:
-        """List files in storage."""
-        return list_files(self.base_path, self._extension, include_deleted=include_deleted)
+        """List logical keys using the configured file handler."""
+        return self._files().list(self._extension, include_deleted=include_deleted)
 
     def list_with_metadata(self, *, include_deleted: bool = False) -> builtins.list[FileMetadata]:
-        """List files and their portable metadata in storage."""
-        return list_files_with_metadata(self.base_path, self._extension, include_deleted=include_deleted)
+        """List portable logical metadata using the file handler."""
+        return self._files().list_with_metadata(self._extension, include_deleted=include_deleted)
 
     def history(self, key: str) -> builtins.list[FileVersionMetadata]:
-        """List historical versions and delete markers for a stored file."""
-        return list_file_versions(self._get_path(key))
+        """List historical versions and delete markers for a stored model."""
+        return self._file(key).history()
 
     def read(self, key: str) -> ModelT:
-        """Read a file from storage."""
-        return self._json_to_model(read_file(self._get_path(key)))
+        """Read a model using the configured file handler."""
+        return self._file(key).read()
 
     def read_with_version(self, key: str) -> tuple[ModelT, str]:
-        """Read canonical JSON with its S3 ETag or local modification version."""
-        contents, version = read_file_with_version(self._get_path(key))
-        return self._json_to_model(contents), version
+        """Read a model and the revision supplied by its file handler."""
+        return self._file(key).read_with_version()
 
     def read_version(self, key: str, version_id: str) -> ModelT:
-        """Read a specific historical version."""
-        return self._json_to_model(read_file(self._get_path(key), version_id=version_id))
+        """Read a historical model using the file handler."""
+        return self._file(key).read(version_id=version_id)
 
     def read_many(self, keys: builtins.list[str], max_workers: int | None = None) -> builtins.list[ModelT]:
         """Read multiple models concurrently while preserving key order."""
@@ -187,8 +194,8 @@ class JsonFileStorage[ModelT]:
         return content
 
     def _write_with_version(self, content: ModelT) -> str:
-        """Write canonical JSON and return the resulting version."""
-        return write_file(self._get_path(getattr(content, self._key_field)), self._model_to_json(content))
+        """Write a model and return the revision supplied by its file handler."""
+        return self._file(getattr(content, self._key_field)).write(content)
 
     def update_if_version(self, content: ModelT, version: str) -> ModelT:
         """Update canonical JSON only when its current version matches."""
@@ -196,9 +203,8 @@ class JsonFileStorage[ModelT]:
         return content
 
     def _update_if_version(self, content: ModelT, version: str) -> str:
-        """Conditionally write canonical JSON and return the resulting version."""
-        key = cast(str, getattr(content, self._key_field))
-        return update_file_if_version_matches(self._get_path(key), self._model_to_json(content), version)
+        """Conditionally update a model using the file handler."""
+        return self._file(getattr(content, self._key_field)).write(content, expected_version=version)
 
     def mutate(
         self,
@@ -236,17 +242,16 @@ class JsonFileStorage[ModelT]:
         ) from mismatch
 
     def delete(self, key: str) -> None:
-        """Delete a file from storage."""
-        delete_file(self._get_path(key))
+        """Delete the logical file using the configured file handler."""
+        self._file(key).delete()
 
     def restore_version(self, key: str, version_id: str) -> ModelT:
         """Restore a historical model as the new current version."""
         return self.update(self.read_version(key, version_id))
 
     def undelete(self, key: str) -> ModelT:
-        """Restore the newest content when a stored file is deleted."""
-        undelete_file(self._get_path(key))
-        return self.read(key)
+        """Restore a deleted model using the file handler."""
+        return self._file(key).undelete()
 
     def get_lock(
         self,
@@ -255,17 +260,15 @@ class JsonFileStorage[ModelT]:
         time_out_seconds: int = 840,
         maximum_age: int = 900,
     ) -> FileLock:
-        """Get a file lock for the stored file."""
-        return FileLock(
-            self._get_path(key),
-            wait_period=wait_period,
-            time_out_seconds=time_out_seconds,
-            maximum_age=maximum_age,
-        )
+        """Get a caller-owned lock from the model's file handler."""
+        return self._file(key).get_lock(wait_period, time_out_seconds, maximum_age)
 
     def _get_path(self, key: str) -> str:
-        """Get the path for a file."""
-        return os.path.join(self.base_path, f"{key}.{self._extension}")
+        """Get the configured physical destination from the file handler."""
+        return self._file(key).primary_path
+
+    def _current_version(self, key: str) -> str:
+        return self._file(key).current_version()
 
 
 @overload
@@ -275,6 +278,9 @@ def json_file_storage_factory[ModelT](
     key_field: str = "key",
     *,
     index: None = None,
+    compression: Literal["gzip"] | None = None,
+    compression_level: int = 1,
+    fallback_uncompressed: bool = False,
 ) -> type[JsonFileStorage[ModelT]]: ...
 
 
@@ -285,6 +291,9 @@ def json_file_storage_factory[ModelT](
     key_field: str = "key",
     *,
     index: JsonIndex[ModelT],
+    compression: Literal["gzip"] | None = None,
+    compression_level: int = 1,
+    fallback_uncompressed: bool = False,
 ) -> type[IndexedJsonFileStorage[ModelT]]: ...
 
 
@@ -294,8 +303,12 @@ def json_file_storage_factory[ModelT](
     key_field: str = "key",
     *,
     index: JsonIndex[ModelT] | None = None,
+    compression: Literal["gzip"] | None = None,
+    compression_level: int = 1,
+    fallback_uncompressed: bool = False,
 ) -> type[JsonFileStorage[ModelT]]:
     """Create a file storage class."""
+    FileHandler.validate_options(compression, compression_level)
     if index is not None and (index.model is not model or index.key_field != key_field):
         raise ValueError("The index model and key field must match the storage factory")
     if index is not None:
@@ -304,7 +317,9 @@ def json_file_storage_factory[ModelT](
         base = cast(type[JsonFileStorage[ModelT]], IndexedJsonFileStorage)
     else:
         base = JsonFileStorage
-    cls = cast(type[JsonFileStorage[ModelT]], type(f"{model.__name__}Storage", (base,), {}))
+    bases = (base,)
+    attributes = {"_index_definition": index} if index is not None else {}
+    cls = cast(type[JsonFileStorage[ModelT]], type(f"{model.__name__}Storage", bases, attributes))
 
     def _json_to_model(json: str) -> ModelT:
         """Convert a JSON object to a model."""
@@ -324,10 +339,11 @@ def json_file_storage_factory[ModelT](
     cls._json_to_model = staticmethod(_json_to_model)  # type: ignore[method-assign]
     cls._dict_to_model = staticmethod(_dict_to_model)  # type: ignore[method-assign]
     cls._model_to_json = staticmethod(_model_to_json)  # type: ignore[method-assign]
+    cls._model = model
+    cls._compression = compression
+    cls._compression_level = compression_level
+    cls._fallback_uncompressed = fallback_uncompressed
     cls._extension = extension
     cls._key_field = key_field
-
-    if index is not None:
-        cast(Any, cls)._index_definition = index
 
     return cls

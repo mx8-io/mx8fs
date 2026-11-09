@@ -26,14 +26,14 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
-from collections.abc import Generator, Mapping
+from collections.abc import Callable, Generator, Mapping
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from glob import glob
-from io import BytesIO
-from typing import IO, Any, Literal, cast
+from io import BytesIO, TextIOWrapper, UnsupportedOperation
+from typing import IO, Any, Literal, Self, cast
 from uuid import uuid4
 
 import boto3
@@ -251,16 +251,11 @@ def get_bucket_key(path: str) -> tuple[str, str]:
 
 
 def file_exists(file: str) -> bool:
-    """Check if a file exists on S3 or local storage."""
-    if file.startswith(S3_PREFIX):
-        bucket, key = get_bucket_key(file)
-        try:
-            s3_client.head_object(Bucket=bucket, Key=key)
-            return True
-        except s3_client.exceptions.ClientError:
-            return False
-
-    return os.path.exists(file)
+    """Preserve the legacy boolean existence API over the physical handler."""
+    try:
+        return BinaryFileHandler.exists(file)
+    except (s3_client.exceptions.ClientError, OSError, VersioningNotSupportedError):
+        return False
 
 
 @contextmanager
@@ -275,167 +270,30 @@ def _get_response(url: str) -> Generator[HTTPResponse, None, None]:
         raise FileNotFoundError(f"HTTPS file {url} could not be read: {exc}") from exc
 
 
-def _list_s3_versions(path: str, *, exact: bool) -> list[FileVersionMetadata]:
-    """List S3 object versions for one file or every file below a root."""
-    bucket, key = get_bucket_key(path)
-    prefix = key if exact else (key + "/" if key and not key.endswith("/") else key)
-    paginator = s3_client.get_paginator("list_object_versions")
-    versions: list[FileVersionMetadata] = []
-    for page in paginator.paginate(Bucket=bucket, Prefix=prefix, PaginationConfig={"PageSize": 1000}):
-        version_groups = (
-            (False, cast(list[dict[str, Any]], page.get("Versions", []))),
-            (True, cast(list[dict[str, Any]], page.get("DeleteMarkers", []))),
-        )
-        for is_deleted, items in version_groups:
-            for item in items:
-                item_key = str(item["Key"])
-                if exact and item_key != key:
-                    continue
-                name = os.path.basename(item_key) if exact else item_key.removeprefix(prefix)
-                versions.append(
-                    FileVersionMetadata(
-                        name=name,
-                        version_id=str(item["VersionId"]),
-                        last_modified=cast(datetime, item["LastModified"]).astimezone(UTC),
-                        size_bytes=0 if is_deleted else int(item["Size"]),
-                        is_latest=bool(item["IsLatest"]),
-                        is_deleted=is_deleted,
-                        revision=None if is_deleted else str(item["ETag"]).strip('"'),
-                    )
-                )
-    versions.sort(key=lambda item: (item.last_modified, item.is_latest), reverse=True)
-    return versions
-
-
-def _list_local_versions(path: str, *, exact: bool) -> list[FileVersionMetadata]:
-    """List local sidecar versions for one file or every file below a root."""
-    if exact:
-        return _load_local_versions_from_path(_require_local_history_path(path))
-
-    history_root = os.path.join(os.path.abspath(path), _LOCAL_HISTORY_DIRECTORY)
-    if not _local_versioning_enabled():
-        raise VersioningNotEnabledError(f"Set {_LOCAL_VERSIONING_ENV}=true to enable local version history")
-    versions: list[FileVersionMetadata] = []
-    for history_path in glob(os.path.join(history_root, "*")):
-        if os.path.isdir(history_path):  # pragma: no branch - sidecar entries are directories
-            versions.extend(_load_local_versions_from_path(history_path))
-    return versions
-
-
-def _list_versions(path: str, *, exact: bool) -> list[FileVersionMetadata]:
-    """List versions through the single historical-discovery backend branch."""
-    if path.startswith(S3_PREFIX):
-        return _list_s3_versions(path, exact=exact)
-    if path.startswith(_HTTPS_PREFIX):
-        raise VersioningNotSupportedError("HTTPS paths do not expose version history")
-    return _list_local_versions(path, exact=exact)
-
-
 def list_file_versions(file: str) -> list[FileVersionMetadata]:
     """Return newest-first historical versions and delete markers for a file."""
-    return _list_versions(file, exact=True)
-
-
-def _version_metadata(file: str, version_id: str) -> FileVersionMetadata:
-    """Return metadata for a requested local version or raise."""
-    return _load_local_version(file, version_id)
-
-
-def _read_version(
-    file: str,
-    version_id: str,
-    *,
-    metadata: FileVersionMetadata | None = None,
-) -> tuple[str, str]:
-    """Read historical content through the single historical-read backend branch."""
-    if metadata is not None and metadata.is_deleted:
-        raise FileVersionDeletedError(f"Version {version_id} of {file} is a delete marker")
-    if file.startswith(S3_PREFIX):
-        bucket, key = get_bucket_key(file)
-        try:
-            response = s3_client.get_object(Bucket=bucket, Key=key, VersionId=version_id)
-        except s3_client.exceptions.ClientError as exc:
-            if exc.response["Error"]["Code"] == "MethodNotAllowed":
-                raise FileVersionDeletedError(f"Version {version_id} of {file} is a delete marker") from exc
-            if exc.response["Error"]["Code"] in {"NoSuchKey", "NoSuchVersion"}:
-                raise VersionNotFoundError(f"Version {version_id} of {file} not found") from exc
-            raise
-        return str(response["Body"].read().decode("utf-8")), str(response["ETag"]).strip('"')
-    if file.startswith(_HTTPS_PREFIX):
-        raise VersioningNotSupportedError("HTTPS paths do not expose version history")
-    metadata = metadata or _version_metadata(file, version_id)
-    if metadata.is_deleted:
-        raise FileVersionDeletedError(f"Version {version_id} of {file} is a delete marker")
-    history_path = _require_local_history_path(file)
-    data_path = os.path.join(history_path, "versions", f"{version_id}.data")
-    try:
-        with open(data_path, encoding="UTF-8") as version_file:
-            return version_file.read(), metadata.revision or metadata.version_id
-    except FileNotFoundError as exc:  # pragma: no cover - corrupt sidecar
-        raise VersionNotFoundError(f"Version {version_id} of {file} not found") from exc
+    return BinaryFileHandler.history(file)
 
 
 def read_file_version(file: str, version: FileVersionMetadata) -> str:
     """Read a previously listed file version without listing its metadata again."""
-    return _read_version(file, version.version_id, metadata=version)[0]
+    with TextFileHandler(file, version_id=version) as source:
+        return source.read()
 
 
 def read_file(file: str, *, version_id: str | None = None) -> str:
     """Read a file from S3, HTTPS, or local storage with UTF-8 encoding."""
-    if version_id is not None:
-        return _read_version(file, version_id)[0]
-    if file.startswith(S3_PREFIX):
-        bucket, key = get_bucket_key(file)
-        try:
-            return str(s3_client.get_object(Bucket=bucket, Key=key)["Body"].read().decode("utf-8"))
-        except s3_client.exceptions.NoSuchKey as exc:
-            raise FileNotFoundError(f"File {file} not found") from exc
-    elif file.startswith("https://"):
-        with _get_response(file) as response:
-            return str(response.read().decode("utf-8"))
-    else:
-        with open(file, encoding="UTF-8") as file_io:
-            return file_io.read()
+    with TextFileHandler(file, version_id=version_id) as source:
+        return source.read()
 
 
 def read_file_with_version(file: str, *, version_id: str | None = None) -> tuple[str, str]:
-    """
-    Read a file from S3 or local storage with UTF-8 encoding and a version identifier.
-
-    For S3, the version identifier is the ETag of the file.
-    For local storage, the version identifier is the last modified time of the file.
-
-    :param file: The file to read
-    :return: The file contents and the version identifier
-    """
-    if version_id is not None:
-        return _read_version(file, version_id)
-    if file.startswith(S3_PREFIX):
-        bucket, key = get_bucket_key(file)
-        try:
-            response = s3_client.get_object(Bucket=bucket, Key=key)
-            return str(response["Body"].read().decode("utf-8")), response["ETag"].strip('"')
-        except s3_client.exceptions.NoSuchKey as exc:
-            raise FileNotFoundError(f"File {file} not found") from exc
-    else:
-        with open(file, encoding="UTF-8") as file_io:
-            return file_io.read(), str(os.fstat(file_io.fileno()).st_mtime_ns)
-
-
-def _get_file_version(file: str) -> str:
-    """Return the current S3 ETag or local modification version."""
-    if file.startswith(S3_PREFIX):
-        bucket, key = get_bucket_key(file)
-        try:
-            return str(s3_client.head_object(Bucket=bucket, Key=key)["ETag"]).strip('"')
-        except s3_client.exceptions.ClientError as exc:
-            if exc.response["Error"]["Code"] in {"404", "NoSuchKey", "NotFound"}:
-                raise FileNotFoundError(f"File {file} not found") from exc
-            raise
-    try:
-        return str(os.stat(file).st_mtime_ns)
-    except FileNotFoundError as exc:
-        raise FileNotFoundError(f"File {file} not found") from exc
+    """Read UTF-8 text with its S3 ETag or local modification version."""
+    with TextFileHandler(file, version_id=version_id) as source:
+        contents = source.read()
+    if source.version is None:
+        raise VersioningNotSupportedError("HTTPS paths do not expose concurrency versions")
+    return contents, source.version
 
 
 def _s3_version_metadata(key: str, response: Mapping[str, Any]) -> FileVersionMetadata:
@@ -451,93 +309,25 @@ def _s3_version_metadata(key: str, response: Mapping[str, Any]) -> FileVersionMe
     )
 
 
-def _current_version_metadata(file: str) -> FileVersionMetadata:
-    """Return current version metadata without enumerating history."""
-    if file.startswith(S3_PREFIX):
-        bucket, key = get_bucket_key(file)
-        try:
-            response = s3_client.head_object(Bucket=bucket, Key=key)
-        except s3_client.exceptions.ClientError as exc:
-            if exc.response["Error"]["Code"] in {"404", "NoSuchKey", "NotFound"}:
-                raise FileNotFoundError(f"File {file} not found") from exc
-            raise
-        return _s3_version_metadata(key, response)
-    versions = _load_local_versions_from_path(_require_local_history_path(file))
-    if not versions:  # pragma: no cover - successful versioned writes create metadata
-        raise VersionNotFoundError(f"Current version of {file} not found")
-    return versions[0]
+def write_file(file: str, data: str | bytes, *, content_type: str | None = None) -> str:
+    """Write a file through the binary handler and return its revision."""
+    return BinaryFileHandler.publish(file, data, content_type=content_type)
 
 
-def write_file(file: str, data: str) -> str:
-    """Write a file and return its S3 ETag or local modification version."""
-    if file.startswith(S3_PREFIX):
-        bucket, key = get_bucket_key(file)
-        response = s3_client.put_object(Bucket=bucket, Key=key, Body=data.encode("UTF-8"))
-        return str(response["ETag"]).strip('"')
-    else:
-        os.makedirs(os.path.dirname(file) or ".", exist_ok=True)
-        with _local_versioned_mutation(file):
-            with open(file, mode="w", encoding="UTF-8") as file_io:
-                file_io.write(data)
-        return str(os.stat(file).st_mtime_ns)
-
-
-def update_file_if_version_matches(file: str, data: str, version: str) -> str:
-    """
-    Write a file to S3 or local storage with UTF-8 encoding if the version matches.
-
-    For S3, the version identifier is the ETag of the file.
-    For local storage, the version identifier is the last modified time of the file.
-
-    :param file: The file to write.
-    :param data: The data to write.
-    :return: The version written by the successful conditional update.
-    """
-    if file.startswith(S3_PREFIX):
-        bucket, key = get_bucket_key(file)
-        try:
-            response = s3_client.put_object(Bucket=bucket, Key=key, Body=data.encode("UTF-8"), IfMatch=version)
-            return str(response["ETag"]).strip('"')
-        except s3_client.exceptions.NoSuchKey as exc:
-            raise FileNotFoundError("File does not exist") from exc
-        except s3_client.exceptions.ClientError as exc:
-            if exc.response["Error"]["Code"] in ["PreconditionFailed", "ConditionalRequestConflict"]:
-                raise VersionMismatchError(f"File version does not match {version}") from exc
-            else:  # pragma: no cover
-                raise exc
-    else:
-        try:
-            current_version = str(os.stat(file).st_mtime_ns)
-        except FileNotFoundError as exc:
-            raise FileNotFoundError(f"File {file} not found") from exc
-        if current_version != version:
-            raise VersionMismatchError(f"File version does not match {version}")
-
-        directory = os.path.dirname(file) or "."
-        descriptor, temporary_path = tempfile.mkstemp(dir=directory)
-        try:
-            with os.fdopen(descriptor, mode="w", encoding="UTF-8") as file_io:
-                file_io.write(data)
-            with _local_versioned_mutation(file):
-                os.replace(temporary_path, file)
-        finally:
-            if os.path.exists(temporary_path):  # pragma: no cover - replace normally consumes it
-                os.remove(temporary_path)
-        return str(os.stat(file).st_mtime_ns)
+def update_file_if_version_matches(
+    file: str,
+    data: str | bytes,
+    version: str,
+    *,
+    content_type: str | None = None,
+) -> str:
+    """Conditionally write through the binary handler and return its revision."""
+    return BinaryFileHandler.publish(file, data, expected_version=version, content_type=content_type)
 
 
 def delete_file(file: str) -> None:
-    """Delete a file from S3 or local storage."""
-    if file.startswith(S3_PREFIX):
-        bucket, key = get_bucket_key(file)
-        s3_client.delete_object(Bucket=bucket, Key=key)
-    else:
-        with _local_versioned_mutation(file):
-            try:
-                os.remove(file)
-            except FileNotFoundError:
-                # Ignore if the file does not exist for S3 consistency
-                pass
+    """Delete a file through the binary handler."""
+    BinaryFileHandler.delete(file)
 
 
 def _delete_files_s3(files: list[str], max_workers: int = 500) -> None:
@@ -574,7 +364,7 @@ def _delete_files_s3(files: list[str], max_workers: int = 500) -> None:
 
 def _delete_files_local(files: list[str], max_workers: int = 500) -> None:
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        executor.map(delete_file, files)
+        executor.map(BinaryFileHandler.delete, files)
 
 
 def delete_files(files: list[str], max_workers: int = 500) -> None:
@@ -689,7 +479,7 @@ def copy_file(src: str, dst: str, chunk_size: int = 131072) -> None:
 def move_file(src: str, dst: str) -> None:
     """Move a file from S3 or local storage."""
     copy_file(src, dst)
-    delete_file(src)
+    BinaryFileHandler.delete(src)
 
 
 def _get_files_s3(
@@ -825,16 +615,8 @@ def get_folders(root_path: str, prefix: str = "") -> list[str]:
 
 
 def list_files(root_path: str, file_type: str, prefix: str = "", *, include_deleted: bool = False) -> list[str]:
-    """
-    Return a list of files from S3 or local storage with the relevant suffix and optional prefix.
-
-    The prefix significantly improves performance for S3 by reducing the number of objects listed.
-    """
-    if include_deleted:
-        return [file.name for file in list_files_with_metadata(root_path, file_type, prefix, include_deleted=True)]
-    if root_path.startswith(S3_PREFIX):
-        return [f.removesuffix(f".{file_type}") for f in get_files(root_path, prefix) if f.endswith(f".{file_type}")]
-    return [os.path.split(f)[1][: -len(file_type) - 1] for f in glob(os.path.join(root_path, f"{prefix}*.{file_type}"))]
+    """List matching files through the binary handler."""
+    return BinaryFileHandler.list_files(root_path, file_type, prefix, include_deleted=include_deleted)
 
 
 def _summarize_versions(
@@ -857,154 +639,18 @@ def list_files_with_metadata(
     *,
     include_deleted: bool = False,
 ) -> list[FileMetadata]:
-    """Return files and their portable metadata from S3 or local storage."""
-    if include_deleted:
-        suffix = f".{file_type}"
-        versions = _list_versions(root_path, exact=False)
-        latest_versions, latest_readable_versions = _summarize_versions(versions)
-        versioned = [
-            FileMetadata(
-                name=version.name.removesuffix(suffix),
-                last_modified=version.last_modified,
-                size_bytes=version.size_bytes,
-                version=version.version_id if version.is_deleted else version.revision or version.version_id,
-                is_deleted=version.is_deleted,
-                latest_readable_version=latest_readable_versions.get(version.name),
-            )
-            for version in latest_versions.values()
-            if version.name.endswith(suffix) and version.name.removesuffix(suffix).startswith(prefix)
-        ]
-        if root_path.startswith(S3_PREFIX):
-            return versioned
-
-        current = list_files_with_metadata(root_path, file_type, prefix)
-        versioned_by_name = {file.name: file for file in versioned}
-        current = [
-            (
-                replace(file, latest_readable_version=versioned_by_name[file.name].latest_readable_version)
-                if file.name in versioned_by_name
-                else file
-            )
-            for file in current
-        ]
-        current_names = {file.name for file in current}
-        deleted = [file for file in versioned if file.is_deleted and file.name not in current_names]
-        return current + deleted
-
-    suffix = f".{file_type}"
-    if root_path.startswith(S3_PREFIX):
-        bucket, key = get_bucket_key(root_path)
-        key = key + "/" if key and not key.endswith("/") else key
-        paginator = s3_client.get_paginator("list_objects_v2")
-        files: list[FileMetadata] = []
-        for page in paginator.paginate(Bucket=bucket, Prefix=key + prefix, PaginationConfig={"PageSize": 10_000}):
-            for item in page.get("Contents", []):
-                relative = str(item["Key"]).removeprefix(key)
-                if relative.endswith(suffix):
-                    files.append(
-                        FileMetadata(
-                            name=relative.removesuffix(suffix),
-                            last_modified=cast(datetime, item["LastModified"]).astimezone(UTC),
-                            size_bytes=int(item["Size"]),
-                            version=str(item["ETag"]).strip('"'),
-                        )
-                    )
-        return files
-
-    files = []
-    for file in glob(os.path.join(root_path, f"{prefix}*{suffix}")):
-        try:
-            file_stat = os.stat(file)
-        except FileNotFoundError:  # pragma: no cover
-            # File may have been deleted after glob returned it.
-            continue
-        files.append(
-            FileMetadata(
-                name=os.path.basename(file).removesuffix(suffix),
-                last_modified=datetime.fromtimestamp(file_stat.st_mtime, tz=UTC),
-                size_bytes=file_stat.st_size,
-                version=str(file_stat.st_mtime_ns),
-            )
-        )
-    return files
-
-
-def _list_current_file_versions(root_path: str, file_type: str) -> dict[str, str]:
-    """Return storage keys mapped to their S3 ETag or local modification version."""
-    return {file.name: file.version for file in list_files_with_metadata(root_path, file_type)}
-
-
-def _restore_file_version(file: str, version: FileVersionMetadata) -> FileVersionMetadata:
-    """Restore known historical text content as a new current version."""
-    data = read_file_version(file, version)
-    write_file(file, data)
-    return _current_version_metadata(file)
-
-
-def _restore_s3_file_version(file: str, version_id: str) -> FileVersionMetadata:
-    """Restore an S3 version with a server-side copy."""
-    bucket, key = get_bucket_key(file)
-    try:
-        s3_client.copy_object(
-            Bucket=bucket,
-            Key=key,
-            CopySource={"Bucket": bucket, "Key": key, "VersionId": version_id},
-        )
-    except s3_client.exceptions.ClientError as exc:
-        if exc.response["Error"]["Code"] in {"NoSuchKey", "NoSuchVersion"}:
-            raise VersionNotFoundError(f"Version {version_id} of {file} not found") from exc
-        raise
-    return _current_version_metadata(file)
+    """List portable file metadata through the binary handler."""
+    return BinaryFileHandler.list_files_with_metadata(root_path, file_type, prefix, include_deleted=include_deleted)
 
 
 def restore_file_version(file: str, version_id: str) -> FileVersionMetadata:
-    """Restore historical text content as a new current version."""
-    if file.startswith(S3_PREFIX):
-        return _restore_s3_file_version(file, version_id)
-    return _restore_file_version(file, _version_metadata(file, version_id))
+    """Restore historical content through the binary handler."""
+    return BinaryFileHandler.restore_version(file, version_id)
 
 
 def undelete_file(file: str) -> FileVersionMetadata:
-    """Restore the newest available content when the current state is deleted."""
-    if file.startswith(S3_PREFIX):
-        return _undelete_s3_file(file)
-    versions = list_file_versions(file)
-    if not versions:
-        raise FileNotFoundError(f"File {file} has no recoverable versions")
-    current = next((version for version in versions if version.is_latest), None)
-    if current is None:
-        raise FileNotFoundError(f"File {file} has no current version")
-    if not current.is_deleted:
-        raise FileNotDeletedError(f"File {file} is not deleted")
-    try:
-        version = max((item for item in versions if not item.is_deleted), key=lambda item: item.last_modified)
-    except ValueError as exc:
-        raise FileNotFoundError(f"File {file} has no recoverable versions") from exc
-    return _restore_file_version(file, version)
-
-
-def _undelete_s3_file(file: str) -> FileVersionMetadata:
-    """Remove current S3 delete markers so the newest live version becomes current."""
-    bucket, key = get_bucket_key(file)
-    removed_marker = False
-    while True:
-        try:
-            response = s3_client.head_object(Bucket=bucket, Key=key)
-        except s3_client.exceptions.ClientError as exc:
-            headers = exc.response.get("ResponseMetadata", {}).get("HTTPHeaders", {})
-            if str(headers.get("x-amz-delete-marker", "")).lower() != "true":
-                if exc.response["Error"]["Code"] in {"404", "NoSuchKey", "NotFound"}:
-                    raise FileNotFoundError(f"File {file} has no recoverable versions") from exc
-                raise
-            version_id = headers.get("x-amz-version-id")
-            if not version_id:  # pragma: no cover - S3 identifies current delete markers
-                raise VersionNotFoundError(f"Current delete marker of {file} has no version ID") from exc
-            s3_client.delete_object(Bucket=bucket, Key=key, VersionId=version_id)
-            removed_marker = True
-            continue
-        if not removed_marker:
-            raise FileNotDeletedError(f"File {file} is not deleted")
-        return _s3_version_metadata(key, response)
+    """Restore deleted content through the binary handler."""
+    return BinaryFileHandler.undelete(file)
 
 
 def most_recent_timestamp(root_path: str, file_type: str) -> float:
@@ -1051,7 +697,16 @@ class BinaryFileHandler:
 
     _buffer: IO[Any]
 
-    def __init__(self, path: str, mode: str = "rb", content_type: str | None = None):
+    def __init__(
+        self,
+        path: str,
+        mode: str = "rb",
+        content_type: str | None = None,
+        *,
+        versioned: bool = False,
+        version_id: str | FileVersionMetadata | None = None,
+        expected_version: str | None = None,
+    ) -> None:
         """
         Create the class, emulating the file object.
 
@@ -1062,6 +717,17 @@ class BinaryFileHandler:
         if mode not in ["rb", "wb"]:
             raise NotImplementedError(f"mode {mode} is not supported")
 
+        if version_id is not None and mode != "rb":
+            raise ValueError("version_id requires read mode")
+        if expected_version is not None and mode != "wb":
+            raise ValueError("expected_version requires write mode")
+        self.versioned = versioned or version_id is not None or expected_version is not None
+        self._version_metadata = version_id if isinstance(version_id, FileVersionMetadata) else None
+        self.version_id = (
+            self._version_metadata.version_id if self._version_metadata is not None else cast(str | None, version_id)
+        )
+        self.expected_version = expected_version
+        self.version: str | None = None
         self.path = path
         self.mode = mode
         self.content_type = content_type
@@ -1073,22 +739,388 @@ class BinaryFileHandler:
             if self.mode != "rb":
                 raise NotImplementedError("Only 'rb' mode is supported for https:// paths")
             self._buffer = BytesIO()
-        elif self.is_s3:
+        elif self.is_s3 or (self.versioned and (mode == "wb" or version_id is not None)):
             self._buffer = BytesIO()
         else:
-            os.makedirs(os.path.dirname(self.path), exist_ok=True)
-            if self.mode == "wb":
-                self._local_mutation = _local_versioned_mutation(self.path)
-                self._local_mutation.__enter__()
-            try:
-                self._buffer = open(  # pylint: disable=consider-using-with
-                    self.path, self.mode, encoding="UTF-8" if self.mode == "w" else None
+            self._open_local()
+
+    @classmethod
+    def _head(cls, file: str) -> Mapping[str, Any]:
+        """Read S3 metadata once with consistent absence and permission handling."""
+        bucket, key = get_bucket_key(file)
+        try:
+            return cast(Mapping[str, Any], s3_client.head_object(Bucket=bucket, Key=key))
+        except s3_client.exceptions.ClientError as error:
+            if error.response["Error"]["Code"] in {"404", "NoSuchKey", "NotFound"}:
+                raise FileNotFoundError(f"File {file} not found") from error
+            raise
+
+    @classmethod
+    def current_version(cls, file: str) -> str:
+        """Return the revision from the same live-metadata implementation."""
+        return cls.metadata(file).version
+
+    @classmethod
+    def exists(cls, file: str) -> bool:
+        """Check physical existence without suppressing permission failures."""
+        try:
+            cls.current_version(file)
+        except FileNotFoundError:
+            return False
+        return True
+
+    @classmethod
+    def publish(
+        cls,
+        file: str,
+        data: str | bytes,
+        *,
+        expected_version: str | None = None,
+        content_type: str | None = None,
+    ) -> str:
+        """Publish bytes or legacy UTF-8 text, optionally conditioned on a revision."""
+        if file.startswith(S3_PREFIX):
+            return cls._publish_s3(file, data, expected_version, content_type)
+        return cls._publish_local(file, data, expected_version)
+
+    @classmethod
+    def _publish_s3(cls, file: str, data: str | bytes, expected: str | None, content_type: str | None) -> str:
+        bucket, key = get_bucket_key(file)
+        options: dict[str, Any] = {
+            "Bucket": bucket,
+            "Key": key,
+            "Body": data.encode("UTF-8") if isinstance(data, str) else data,
+        }
+        if expected is not None:
+            options["IfMatch"] = expected
+        if content_type is not None:
+            options["ContentType"] = content_type
+        try:
+            response = s3_client.put_object(**options)
+        except s3_client.exceptions.ClientError as error:
+            if expected is not None:
+                code = error.response["Error"]["Code"]
+                if code == "NoSuchKey":
+                    raise FileNotFoundError(f"File {file} not found") from error
+                if code in {"PreconditionFailed", "ConditionalRequestConflict"}:
+                    raise VersionMismatchError(f"File version does not match {expected}") from error
+            raise
+        return str(response["ETag"]).strip('"')
+
+    @classmethod
+    def _publish_local(cls, file: str, data: str | bytes, expected: str | None) -> str:
+        if expected is not None and cls.current_version(file) != expected:
+            raise VersionMismatchError(f"File version does not match {expected}")
+        os.makedirs(os.path.dirname(file) or ".", exist_ok=True)
+        if expected is None:
+            with _local_versioned_mutation(file):
+                if isinstance(data, bytes):
+                    _atomic_write_bytes(os.path.abspath(file), data)
+                else:
+                    with open(file, mode="w", encoding="UTF-8") as output:
+                        output.write(data)
+            return cls.current_version(file)
+        directory = os.path.dirname(file) or "."
+        descriptor, temporary_path = tempfile.mkstemp(dir=directory)
+        try:
+            with os.fdopen(
+                descriptor,
+                mode="wb" if isinstance(data, bytes) else "w",
+                encoding=None if isinstance(data, bytes) else "UTF-8",
+            ) as output:
+                output.write(data)
+            with _local_versioned_mutation(file):
+                os.replace(temporary_path, file)
+        finally:
+            if os.path.exists(temporary_path):
+                os.remove(temporary_path)
+        return cls.current_version(file)
+
+    @classmethod
+    def version_metadata(cls, file: str) -> FileVersionMetadata:
+        """Return current version metadata without enumerating history."""
+        if file.startswith(S3_PREFIX):
+            bucket, key = get_bucket_key(file)
+            response = cls._head(file)
+            return _s3_version_metadata(key, response)
+        versions = _load_local_versions_from_path(_require_local_history_path(file))
+        if not versions:
+            raise VersionNotFoundError(f"Current version of {file} not found")
+        return versions[0]
+
+    @classmethod
+    def metadata(cls, file: str) -> FileMetadata:
+        """Read live portable metadata without enumerating a directory or history."""
+        if file.startswith(S3_PREFIX):
+            version = cls.version_metadata(file)
+            return FileMetadata(
+                name=version.name,
+                last_modified=version.last_modified,
+                size_bytes=version.size_bytes,
+                version=version.revision or version.version_id,
+            )
+        if file.startswith(_HTTPS_PREFIX):
+            raise VersioningNotSupportedError("HTTPS paths do not expose portable metadata")
+        info = os.stat(file)
+        return FileMetadata(
+            name=os.path.basename(file),
+            last_modified=datetime.fromtimestamp(info.st_mtime, UTC),
+            size_bytes=info.st_size,
+            version=str(info.st_mtime_ns),
+        )
+
+    @classmethod
+    def delete(cls, file: str) -> None:
+        """Delete a file from S3 or local storage."""
+        if file.startswith(S3_PREFIX):
+            bucket, key = get_bucket_key(file)
+            s3_client.delete_object(Bucket=bucket, Key=key)
+        else:
+            with _local_versioned_mutation(file):
+                try:
+                    os.remove(file)
+                except FileNotFoundError:
+                    pass
+
+    @classmethod
+    def history(cls, file: str) -> list[FileVersionMetadata]:
+        """Return newest-first historical versions and delete markers for a file."""
+        return cls._list_versions(file, exact=True)
+
+    @classmethod
+    def list_files(
+        cls, root_path: str, file_type: str, prefix: str = "", *, include_deleted: bool = False
+    ) -> list[str]:
+        """
+        Return a list of files from S3 or local storage with the relevant suffix and optional prefix.
+
+        The prefix significantly improves performance for S3 by reducing the number of objects listed.
+        """
+        if include_deleted:
+            return [
+                file.name for file in cls.list_files_with_metadata(root_path, file_type, prefix, include_deleted=True)
+            ]
+        if root_path.startswith(S3_PREFIX):
+            return [
+                f.removesuffix(f".{file_type}") for f in get_files(root_path, prefix) if f.endswith(f".{file_type}")
+            ]
+        return [
+            os.path.split(f)[1][: -len(file_type) - 1] for f in glob(os.path.join(root_path, f"{prefix}*.{file_type}"))
+        ]
+
+    @classmethod
+    def list_files_with_metadata(
+        cls, root_path: str, file_type: str, prefix: str = "", *, include_deleted: bool = False
+    ) -> list[FileMetadata]:
+        """Return files and their portable metadata from S3 or local storage."""
+        if include_deleted:
+            suffix = f".{file_type}"
+            versions = cls._list_versions(root_path, exact=False)
+            latest_versions, latest_readable_versions = _summarize_versions(versions)
+            versioned = [
+                FileMetadata(
+                    name=version.name.removesuffix(suffix),
+                    last_modified=version.last_modified,
+                    size_bytes=version.size_bytes,
+                    version=version.version_id if version.is_deleted else version.revision or version.version_id,
+                    is_deleted=version.is_deleted,
+                    latest_readable_version=latest_readable_versions.get(version.name),
                 )
-            except BaseException as error:
-                if self._local_mutation is not None:
-                    self._local_mutation.__exit__(type(error), error, error.__traceback__)
-                    self._local_mutation = None
-                raise
+                for version in latest_versions.values()
+                if version.name.endswith(suffix) and version.name.removesuffix(suffix).startswith(prefix)
+            ]
+            if root_path.startswith(S3_PREFIX):
+                return versioned
+            current = cls.list_files_with_metadata(root_path, file_type, prefix)
+            versioned_by_name = {file.name: file for file in versioned}
+            current = [
+                (
+                    replace(file, latest_readable_version=versioned_by_name[file.name].latest_readable_version)
+                    if file.name in versioned_by_name
+                    else file
+                )
+                for file in current
+            ]
+            current_names = {file.name for file in current}
+            deleted = [file for file in versioned if file.is_deleted and file.name not in current_names]
+            return current + deleted
+        suffix = f".{file_type}"
+        if root_path.startswith(S3_PREFIX):
+            bucket, key = get_bucket_key(root_path)
+            key = key + "/" if key and (not key.endswith("/")) else key
+            paginator = s3_client.get_paginator("list_objects_v2")
+            files: list[FileMetadata] = []
+            for page in paginator.paginate(Bucket=bucket, Prefix=key + prefix, PaginationConfig={"PageSize": 10000}):
+                for item in page.get("Contents", []):
+                    relative = str(item["Key"]).removeprefix(key)
+                    if relative.endswith(suffix):
+                        files.append(
+                            FileMetadata(
+                                name=relative.removesuffix(suffix),
+                                last_modified=cast(datetime, item["LastModified"]).astimezone(UTC),
+                                size_bytes=int(item["Size"]),
+                                version=str(item["ETag"]).strip('"'),
+                            )
+                        )
+            return files
+        files = []
+        for file in glob(os.path.join(root_path, f"{prefix}*{suffix}")):
+            try:
+                file_stat = os.stat(file)
+            except FileNotFoundError:
+                continue
+            files.append(
+                FileMetadata(
+                    name=os.path.basename(file).removesuffix(suffix),
+                    last_modified=datetime.fromtimestamp(file_stat.st_mtime, tz=UTC),
+                    size_bytes=file_stat.st_size,
+                    version=str(file_stat.st_mtime_ns),
+                )
+            )
+        return files
+
+    @classmethod
+    def _list_versions(cls, path: str, *, exact: bool) -> list[FileVersionMetadata]:
+        """List versions through the single historical-discovery backend branch."""
+        if path.startswith(S3_PREFIX):
+            return cls._list_s3_versions(path, exact=exact)
+        if path.startswith(_HTTPS_PREFIX):
+            raise VersioningNotSupportedError("HTTPS paths do not expose version history")
+        return cls._list_local_versions(path, exact=exact)
+
+    @classmethod
+    def _list_s3_versions(cls, path: str, *, exact: bool) -> list[FileVersionMetadata]:
+        """List S3 object versions for one file or every file below a root."""
+        bucket, key = get_bucket_key(path)
+        prefix = key if exact else key + "/" if key and (not key.endswith("/")) else key
+        paginator = s3_client.get_paginator("list_object_versions")
+        versions: list[FileVersionMetadata] = []
+        for page in paginator.paginate(Bucket=bucket, Prefix=prefix, PaginationConfig={"PageSize": 1000}):
+            version_groups = (
+                (False, cast(list[dict[str, Any]], page.get("Versions", []))),
+                (True, cast(list[dict[str, Any]], page.get("DeleteMarkers", []))),
+            )
+            for is_deleted, items in version_groups:
+                for item in items:
+                    item_key = str(item["Key"])
+                    if exact and item_key != key:
+                        continue
+                    name = os.path.basename(item_key) if exact else item_key.removeprefix(prefix)
+                    versions.append(
+                        FileVersionMetadata(
+                            name=name,
+                            version_id=str(item["VersionId"]),
+                            last_modified=cast(datetime, item["LastModified"]).astimezone(UTC),
+                            size_bytes=0 if is_deleted else int(item["Size"]),
+                            is_latest=bool(item["IsLatest"]),
+                            is_deleted=is_deleted,
+                            revision=None if is_deleted else str(item["ETag"]).strip('"'),
+                        )
+                    )
+        versions.sort(key=lambda item: (item.last_modified, item.is_latest), reverse=True)
+        return versions
+
+    @classmethod
+    def _list_local_versions(cls, path: str, *, exact: bool) -> list[FileVersionMetadata]:
+        """List local sidecar versions for one file or every file below a root."""
+        if exact:
+            return _load_local_versions_from_path(_require_local_history_path(path))
+        history_root = os.path.join(os.path.abspath(path), _LOCAL_HISTORY_DIRECTORY)
+        if not _local_versioning_enabled():
+            raise VersioningNotEnabledError(f"Set {_LOCAL_VERSIONING_ENV}=true to enable local version history")
+        versions: list[FileVersionMetadata] = []
+        for history_path in glob(os.path.join(history_root, "*")):
+            if os.path.isdir(history_path):
+                versions.extend(_load_local_versions_from_path(history_path))
+        return versions
+
+    @classmethod
+    def _restore_known_version(cls, file: str, version: FileVersionMetadata) -> FileVersionMetadata:
+        """Restore exact historical bytes as a new current version."""
+        with cls(file, version_id=version) as source:
+            data = source.read()
+        cls.publish(file, data)
+        return cls.version_metadata(file)
+
+    @classmethod
+    def _restore_s3_version(cls, file: str, version_id: str) -> FileVersionMetadata:
+        """Restore an S3 version with a server-side copy."""
+        bucket, key = get_bucket_key(file)
+        try:
+            s3_client.copy_object(
+                Bucket=bucket, Key=key, CopySource={"Bucket": bucket, "Key": key, "VersionId": version_id}
+            )
+        except s3_client.exceptions.ClientError as exc:
+            if exc.response["Error"]["Code"] in {"NoSuchKey", "NoSuchVersion"}:
+                raise VersionNotFoundError(f"Version {version_id} of {file} not found") from exc
+            raise
+        return cls.version_metadata(file)
+
+    @classmethod
+    def restore_version(cls, file: str, version_id: str) -> FileVersionMetadata:
+        """Restore historical text content as a new current version."""
+        if file.startswith(S3_PREFIX):
+            return cls._restore_s3_version(file, version_id)
+        return cls._restore_known_version(file, _load_local_version(file, version_id))
+
+    @classmethod
+    def undelete(cls, file: str) -> FileVersionMetadata:
+        """Restore the newest available content when the current state is deleted."""
+        if file.startswith(S3_PREFIX):
+            return cls._undelete_s3(file)
+        versions = cls.history(file)
+        if not versions:
+            raise FileNotFoundError(f"File {file} has no recoverable versions")
+        current = next((version for version in versions if version.is_latest), None)
+        if current is None:
+            raise FileNotFoundError(f"File {file} has no current version")
+        if not current.is_deleted:
+            raise FileNotDeletedError(f"File {file} is not deleted")
+        try:
+            version = max((item for item in versions if not item.is_deleted), key=lambda item: item.last_modified)
+        except ValueError as exc:
+            raise FileNotFoundError(f"File {file} has no recoverable versions") from exc
+        return cls._restore_known_version(file, version)
+
+    @classmethod
+    def _undelete_s3(cls, file: str) -> FileVersionMetadata:
+        """Remove current S3 delete markers so the newest live version becomes current."""
+        bucket, key = get_bucket_key(file)
+        removed_marker = False
+        while True:
+            try:
+                response = s3_client.head_object(Bucket=bucket, Key=key)
+            except s3_client.exceptions.ClientError as exc:
+                headers = exc.response.get("ResponseMetadata", {}).get("HTTPHeaders", {})
+                if str(headers.get("x-amz-delete-marker", "")).lower() != "true":
+                    if exc.response["Error"]["Code"] in {"404", "NoSuchKey", "NotFound"}:
+                        raise FileNotFoundError(f"File {file} has no recoverable versions") from exc
+                    raise
+                version_id = headers.get("x-amz-version-id")
+                if not version_id:
+                    raise VersionNotFoundError(f"Current delete marker of {file} has no version ID") from exc
+                s3_client.delete_object(Bucket=bucket, Key=key, VersionId=version_id)
+                removed_marker = True
+                continue
+            if not removed_marker:
+                raise FileNotDeletedError(f"File {file} is not deleted")
+            return _s3_version_metadata(key, response)
+
+    def _open_local(self) -> None:
+        """Open the existing local stream and manage its history lifecycle."""
+        os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
+        if self.mode == "wb":
+            self._local_mutation = _local_versioned_mutation(self.path)
+            self._local_mutation.__enter__()
+        try:
+            self._buffer = open(self.path, self.mode)  # pylint: disable=consider-using-with
+            if self.mode == "rb":
+                self.version = str(os.fstat(self._buffer.fileno()).st_mtime_ns)
+        except BaseException as error:
+            if self._local_mutation is not None:
+                self._local_mutation.__exit__(type(error), error, error.__traceback__)
+                self._local_mutation = None
+            raise
 
     def _set_buffer_http(self) -> None:
         with _get_response(self.path) as response:
@@ -1098,6 +1130,27 @@ class BinaryFileHandler:
     def _set_buffer_s3(self) -> None:
         bucket, key = get_bucket_key(self.path)
         if self.mode == "rb":
+            if self.versioned:
+                try:
+                    options: dict[str, Any] = {"Bucket": bucket, "Key": key}
+                    if self.version_id is not None:
+                        options["VersionId"] = self.version_id
+                    response = s3_client.get_object(**options)
+                except s3_client.exceptions.ClientError as error:
+                    code = error.response["Error"]["Code"]
+                    if code == "MethodNotAllowed" and self.version_id is not None:
+                        raise FileVersionDeletedError(
+                            f"Version {self.version_id} of {self.path} is a delete marker"
+                        ) from error
+                    if code in {"NoSuchKey", "NoSuchVersion", "404", "NotFound"}:
+                        error_type = VersionNotFoundError if self.version_id is not None else FileNotFoundError
+                        raise error_type(f"File {self.path} version {self.version_id} not found") from error
+                    raise
+                with response["Body"] as source:
+                    self._buffer.write(source.read())
+                self.version = str(response["ETag"]).strip('"')
+                self._buffer.seek(0)
+                return
             # Download the file from S3 to the stream
             try:
                 s3_client.download_fileobj(Bucket=bucket, Key=key, Fileobj=self._buffer)
@@ -1105,20 +1158,50 @@ class BinaryFileHandler:
                 raise FileNotFoundError(f"File {self.path} not found") from exc
             self._buffer.seek(0)
 
+    def _set_buffer_local_version(self) -> None:
+        """Read immutable sidecar bytes using known metadata when available."""
+        assert self.version_id is not None
+        metadata = self._version_metadata or _load_local_version(self.path, self.version_id)
+        if metadata.is_deleted:
+            raise FileVersionDeletedError(f"Version {self.version_id} of {self.path} is a delete marker")
+        history_path = _require_local_history_path(self.path)
+        data_path = os.path.join(history_path, "versions", f"{self.version_id}.data")
+        try:
+            with open(data_path, "rb") as source:
+                self._buffer.write(source.read())
+        except FileNotFoundError as error:  # pragma: no cover - corrupt sidecar
+            raise VersionNotFoundError(f"Version {self.version_id} of {self.path} not found") from error
+        self.version = metadata.revision or metadata.version_id
+        self._buffer.seek(0)
+
     def __enter__(self) -> BytesIO | IO:
-        """Read from S3, HTTPS, or open the stream."""
+        """Read current or historical content through the appropriate backend."""
+        if self._version_metadata is not None and self._version_metadata.is_deleted:
+            raise FileVersionDeletedError(f"Version {self.version_id} of {self.path} is a delete marker")
         if self.is_https:
+            if self.version_id is not None:
+                raise VersioningNotSupportedError("HTTPS paths do not expose version history")
             self._set_buffer_http()
-
-        if self.is_s3:
+        elif self.is_s3:
             self._set_buffer_s3()
-
+        elif self.version_id is not None:
+            self._set_buffer_local_version()
         return self._buffer
 
     def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
         """Write to S3 or local storage and close the stream."""
         try:
-            if self.is_s3 and self.mode == "wb":
+            if self.versioned and self.mode == "wb":
+                if exc_type is None:
+                    self._buffer.seek(0)
+                    data = self._buffer.read()
+                    self.version = self.publish(
+                        self.path,
+                        data,
+                        expected_version=self.expected_version,
+                        content_type=self.content_type,
+                    )
+            elif self.is_s3 and self.mode == "wb":
                 self._buffer.seek(0)
                 bucket, key = get_bucket_key(self.path)
                 try:
@@ -1137,26 +1220,200 @@ class BinaryFileHandler:
                 self._local_mutation = None
 
 
-@contextmanager
-def GzipFileHandler(  # noqa: N802
-    path: str, mode: str = "rb", encoding: str | None = None
-) -> Generator[Any, Any, None]:
-    """
-    Open gzip-compressed files from S3 or local storage.
+class GzipFileHandler:
+    """Wrap BinaryFileHandler with gzip while preserving its version and publication lifecycle."""
 
-    Context manager for reading/writing gzip-compressed files from S3 or local storage,
-    using BinaryFileHandler for the underlying file I/O.
-    Supports binary ('rb', 'wb') and text ('rt', 'wt') modes.
-    Usage:
-        with GzipFileHandler(path, mode, encoding='utf-8') as f:
-            f.read() / f.write(...).
-    """
-    if mode not in ("rb", "wb", "rt", "wt"):
-        raise NotImplementedError(f"mode {mode} is not supported")
-    file_mode = mode.replace("t", "b")
-    with BinaryFileHandler(path, file_mode) as base_file:
-        with gzip.open(base_file, mode, encoding=encoding) as gz_file:
-            yield gz_file
+    def __init__(
+        self,
+        path: str,
+        mode: str = "rb",
+        encoding: str | None = None,
+        *,
+        compression_level: int = 9,
+        versioned: bool = False,
+        version_id: str | FileVersionMetadata | None = None,
+        expected_version: str | None = None,
+    ) -> None:
+        """Configure gzip and optional current, historical or conditional binary I/O."""
+        if mode not in ("rb", "wb", "rt", "wt"):
+            raise NotImplementedError(f"mode {mode} is not supported")
+        if not 0 <= compression_level <= 9:
+            raise ValueError("compression_level must be between 0 and 9")
+        self._binary = BinaryFileHandler(
+            path,
+            mode.replace("t", "b"),
+            versioned=versioned,
+            version_id=version_id,
+            expected_version=expected_version,
+        )
+        self._mode = mode
+        self._encoding = encoding
+        self._compression_level = compression_level
+        self._contexts = ExitStack()
+
+    @property
+    def version(self) -> str | None:
+        """Return the revision read or successfully published by the binary handler."""
+        return self._binary.version
+
+    def __enter__(self) -> Any:
+        """Open gzip after the underlying binary read has completed."""
+        with ExitStack() as contexts:
+            source = contexts.enter_context(self._binary)
+            stream = contexts.enter_context(
+                gzip.open(source, self._mode, compresslevel=self._compression_level, encoding=self._encoding)
+            )
+            self._contexts = contexts.pop_all()
+            return stream
+
+    def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
+        """Finish gzip before the binary handler decides whether to publish."""
+        self._contexts.__exit__(exc_type, exc_value, traceback)
+
+
+def _validate_compression(compression: str | None, level: int) -> None:
+    """Validate the compression settings shared by typed file handlers."""
+    if compression not in {None, "gzip"}:
+        raise ValueError("compression must be None or 'gzip'")
+    if not 0 <= level <= 9:
+        raise ValueError("compression_level must be between 0 and 9")
+
+
+class TextFileHandler:
+    """Add text encoding and newline handling to version-aware binary or gzip I/O."""
+
+    def __init__(
+        self,
+        path: str,
+        mode: str = "r",
+        *,
+        encoding: str = "utf-8",
+        newline: str | None = "auto",
+        compression: Literal["gzip"] | None = None,
+        compression_level: int = 1,
+        version_id: str | FileVersionMetadata | None = None,
+        expected_version: str | None = None,
+    ) -> None:
+        """
+        Configure a text stream without opening or truncating the destination.
+
+        Auto preserves remote line endings and normalizes local ones, matching legacy
+        text reads. Explicit newline values retain TextIOWrapper semantics.
+        """
+        if mode not in {"r", "w"}:
+            raise NotImplementedError(f"mode {mode} is not supported")
+        _validate_compression(compression, compression_level)
+        self._mode = mode
+        self._encoding = encoding
+        if newline == "auto":
+            newline = "" if path.startswith((S3_PREFIX, _HTTPS_PREFIX)) else None
+        self._newline = newline
+        self._contexts = ExitStack()
+        self._text: TextIOWrapper
+        self._handler: BinaryFileHandler | GzipFileHandler
+        if compression == "gzip":
+            self._handler = GzipFileHandler(
+                path,
+                mode + "b",
+                compression_level=compression_level,
+                versioned=True,
+                version_id=version_id,
+                expected_version=expected_version,
+            )
+        else:
+            self._handler = BinaryFileHandler(
+                path,
+                mode + "b",
+                versioned=True,
+                version_id=version_id,
+                expected_version=expected_version,
+            )
+
+    @property
+    def version(self) -> str | None:
+        """Return the revision read or successfully written by the underlying handler."""
+        return self._handler.version
+
+    def __enter__(self) -> Self:
+        """Open text while retaining the binary handler's publication ownership."""
+        with ExitStack() as contexts:
+            stream = contexts.enter_context(self._handler)
+            self._text = TextIOWrapper(stream, encoding=self._encoding, newline=self._newline)
+            contexts.callback(self._text.detach)
+            self._contexts = contexts.pop_all()
+        return self
+
+    def read(self, size: int = -1) -> str:
+        """Read decoded text with the configured newline behavior."""
+        if self._mode != "r":
+            raise UnsupportedOperation("Text handler is not readable")
+        return self._text.read(size)
+
+    def write(self, content: str) -> int:
+        """Write text, flushing it before the binary handler publishes."""
+        if self._mode != "w":
+            raise UnsupportedOperation("Text handler is not writable")
+        return self._text.write(content)
+
+    def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
+        """Flush and detach text before compression and publication finish."""
+        self._contexts.__exit__(exc_type, exc_value, traceback)
+
+
+class JsonFileHandler[ContentT]:
+    """Read and write JSON values through the existing binary or gzip handler."""
+
+    def __init__(
+        self,
+        path: str,
+        mode: str = "r",
+        *,
+        compression: Literal["gzip"] | None = None,
+        compression_level: int = 1,
+        version_id: str | FileVersionMetadata | None = None,
+        expected_version: str | None = None,
+        decoder: Callable[[str], ContentT] = json.loads,
+        encoder: Callable[[ContentT], str] = json.dumps,
+    ) -> None:
+        """Configure JSON conversion, compression and version-aware publication."""
+        self._mode = mode
+        self._decoder = decoder
+        self._encoder = encoder
+        self._handler = TextFileHandler(
+            path,
+            mode,
+            newline="",
+            compression=compression,
+            compression_level=compression_level,
+            version_id=version_id,
+            expected_version=expected_version,
+        )
+
+    @property
+    def version(self) -> str | None:
+        """Return the revision read or successfully written by the underlying handler."""
+        return self._handler.version
+
+    def __enter__(self) -> Self:
+        """Open the underlying stream and expose JSON read and write operations."""
+        self._handler.__enter__()
+        return self
+
+    def read(self) -> ContentT:
+        """Decode one JSON document using the configured decoder."""
+        if self._mode != "r":
+            raise UnsupportedOperation("JSON handler is not readable")
+        return self._decoder(self._handler.read())
+
+    def write(self, content: ContentT) -> None:
+        """Encode one JSON document using the configured encoder."""
+        if self._mode != "w":
+            raise UnsupportedOperation("JSON handler is not writable")
+        self._handler.write(self._encoder(content))
+
+    def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
+        """Finish compression and publish only after successful JSON serialization."""
+        self._handler.__exit__(exc_type, exc_value, traceback)
 
 
 def purge_folder(

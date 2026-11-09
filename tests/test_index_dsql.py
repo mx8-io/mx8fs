@@ -11,7 +11,6 @@ import pytest
 from pydantic import BaseModel, Field
 from sqlalchemy import delete
 
-import mx8fs.indexed_storage as indexed_storage_module
 from mx8fs import json_file_storage_factory, json_index_factory
 from mx8fs.file_io import delete_files, write_file
 from mx8fs.index import NAMESPACE_COLUMN
@@ -89,15 +88,15 @@ def test_dsql_rebuilds_1000_s3_records_within_15_seconds(monkeypatch: pytest.Mon
     index = json_index_factory(LiveRecord, ["status", "created_at"], table_name="mx8fs_live_records")
     storage_type = json_file_storage_factory("json", LiveRecord, index=index)
     storage = storage_type(root)
-    real_list_versions = indexed_storage_module._list_current_file_versions
+    real_list_versions = storage._listed_versions
     real_replace_namespace = storage._index_manager.replace_namespace
     list_seconds = 0.0
     replace_seconds = 0.0
 
-    def timed_list_versions(*args: str) -> dict[str, str]:
+    def timed_list_versions() -> dict[str, str]:
         nonlocal list_seconds
         started = perf_counter()
-        result = real_list_versions(*args)
+        result = real_list_versions()
         list_seconds += perf_counter() - started
         return result
 
@@ -107,7 +106,7 @@ def test_dsql_rebuilds_1000_s3_records_within_15_seconds(monkeypatch: pytest.Mon
         real_replace_namespace(records)
         replace_seconds += perf_counter() - started
 
-    monkeypatch.setattr(indexed_storage_module, "_list_current_file_versions", timed_list_versions)
+    monkeypatch.setattr(storage, "_listed_versions", timed_list_versions)
     monkeypatch.setattr(storage._index_manager, "replace_namespace", timed_replace_namespace)
     now = datetime.now(UTC)
     keys = [f"record-{number:04d}" for number in range(1000)]

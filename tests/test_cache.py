@@ -17,11 +17,33 @@ OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHE
 TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 """
 
+from io import BytesIO
 from pathlib import Path
 from random import random
 from time import sleep
 
-from mx8fs import cache_to_disk, cache_to_disk_binary
+from botocore.stub import Stubber
+
+from mx8fs import cache_to_disk, cache_to_disk_binary, get_cache_filename
+from mx8fs.file_io import s3_client
+
+
+def test_remote_text_cache_preserves_newlines() -> None:
+    root = "s3://bucket/cache"
+
+    @cache_to_disk(root)
+    def content() -> str:
+        raise AssertionError("An existing cache entry must be used")
+
+    key = get_cache_filename("cache", "content", "txt")
+    with Stubber(s3_client) as stub:
+        stub.add_response(
+            "get_object",
+            {"Body": BytesIO(b"first\r\nsecond"), "ETag": '"cached"'},
+            {"Bucket": "bucket", "Key": key},
+        )
+        assert content() == "first\r\nsecond"
+        stub.assert_no_pending_responses()
 
 
 def test_cache(tmp_path: Path) -> None:

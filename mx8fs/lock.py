@@ -50,7 +50,8 @@ from botocore.exceptions import ClientError
 from filelock import FileLock as LocalFileLock
 from filelock import Timeout as LocalLockTimeout
 
-from .file_io import _atomic_write_bytes, get_bucket_key, read_file_with_version, s3_client
+from .file_io import _atomic_write_bytes, get_bucket_key, s3_client
+from .handler import FileHandler
 
 logger = logging.getLogger("mx8.lock")
 
@@ -177,10 +178,9 @@ class BaseLock(ABC):
     def _read_lock(self) -> _LockRecord | None:
         """Read the claim record and its storage version together."""
         try:
-            contents, version = read_file_with_version(self._lock_file)
+            record, version = FileHandler(self._lock_file, dict).read_with_version()
         except FileNotFoundError:
             return None
-        record = json.loads(contents)
         # Retain the stored "owner" field for compatibility; it identifies a claim, not a user.
         claim_id, created_at = record["owner"], record["created_at"]
         if not isinstance(claim_id, str) or not isinstance(created_at, (int, float)) or not isfinite(created_at):
