@@ -507,6 +507,11 @@ and fall back only on absence; corrupt gzip, invalid JSON and permission errors 
 deduplicate logical keys, key allocation checks both names, and deletion removes both current representations.
 Normal writes finish publishing gzip before deleting the plain current object.
 
+Local Unix file modes are not configurable through the storage API. Creating a gzip destination uses
+normal creation permissions and the process umask; it does not inherit the plain file's mode. Under
+umask `022`, migrating a `0600` plain file can therefore create a `0644` gzip file. Use a restrictive
+process umask when creating private local records. An existing gzip destination retains its own mode.
+
 Gzip-mode concurrency tokens identify the representation with `gzip:` or `plain:`. Pass them unchanged to
 `update_if_version()`. Conditional mutations retain the representation read: a plain mutation stays plain
 until a normal save. A concurrent gzip publication causes a plain mutation to report a version conflict so
