@@ -513,6 +513,10 @@ until a normal save. A concurrent gzip publication causes a plain mutation to re
 `mutate()` can reread and recompute. Normal saves and deletes are not cross-object transactions; coordinate
 them with `get_lock()` when the application needs serialization.
 
+Locks use the logical filename so plain and gzip callers serialize access to the same record.
+With local history enabled, migration captures the plain state before publishing gzip so recovery
+selects the newly saved value.
+
 History combines both filenames and supplies tagged `version_id` values for `read_version()` and
 `restore_version()`. Deleted listing metadata includes a tagged `latest_readable_version` when available.
 Existing untagged historical IDs are accepted, trying gzip then plain only if that version is absent.

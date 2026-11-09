@@ -9,6 +9,7 @@ from collections.abc import Callable, Generator
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, Literal, cast
+from urllib.error import HTTPError, URLError
 
 from .file_io import (
     BinaryFileHandler,
@@ -194,17 +195,26 @@ class FileHandler[ContentT]:
         compressed, reference, fallback = self._read_target(version_id)
         missing = FileNotFoundError if version_id is None else VersionNotFoundError
         with ExitStack() as contexts:
-            try:
+
+            def open_target(compressed: bool) -> FileReader[ContentT]:
                 handler = self._physical_handler("r", compressed, version_id=reference)
-                source = contexts.enter_context(handler)
+                try:
+                    source = contexts.enter_context(handler)
+                except FileNotFoundError as error:
+                    cause = error.__cause__
+                    if isinstance(cause, URLError) and (not isinstance(cause, HTTPError) or cause.code != 404):
+                        raise cause from None
+                    raise
+                self.version = self._version_token(handler.version, compressed) if handler.version is not None else None
+                return FileReader(read=cast(Callable[[], ContentT], source.read), version=self.version)
+
+            try:
+                reader = open_target(compressed)
             except missing:
                 if not fallback:
                     raise
-                compressed = False
-                handler = self._physical_handler("r", False, version_id=reference)
-                source = contexts.enter_context(handler)
-            self.version = self._version_token(handler.version, compressed) if handler.version is not None else None
-            yield FileReader(read=cast(Callable[[], ContentT], source.read), version=self.version)
+                reader = open_target(False)
+            yield reader
 
     def read(self, *, version_id: str | FileVersionMetadata | None = None) -> ContentT:
         """Read current or historical content using the configured type."""
@@ -228,6 +238,8 @@ class FileHandler[ContentT]:
         compressed, expected = self.compression is not None, None
         if expected_version is not None:
             compressed, expected = self._parse_version(expected_version)
+        if expected_version is None and self.fallback_uncompressed:
+            BinaryFileHandler.capture_version(self.path)
         retain_plain = self.compression is not None and not compressed
         try:
             if retain_plain:
@@ -401,11 +413,11 @@ class FileHandler[ContentT]:
         time_out_seconds: int = 840,
         maximum_age: int = 900,
     ) -> FileLock:
-        """Create a caller-owned lock for this logical file's configured destination."""
+        """Create a caller-owned lock shared by every representation of this logical file."""
         from .lock import FileLock
 
         return FileLock(
-            self.primary_path,
+            self.path,
             wait_period=wait_period,
             time_out_seconds=time_out_seconds,
             maximum_age=maximum_age,

@@ -431,26 +431,6 @@ def _copy_to_s3(src: str, dst: str, chunk_size: int) -> None:
             raise PermissionError(f"Cannot write to {dst}.") from exc
 
 
-def _copy_to_local(src: str, dst: str, chunk_size: int) -> None:
-    destination_directory = os.path.dirname(dst) or "."
-    os.makedirs(destination_directory, exist_ok=True)
-    temporary_path = os.path.join(destination_directory, f".{os.path.basename(dst)}.{uuid4().hex}.tmp")
-    destination_mode = stat.S_IMODE(os.stat(dst).st_mode) if os.path.exists(dst) else None
-
-    try:
-        with _open_copy_source(src) as source:
-            with open(temporary_path, "xb") as destination:
-                _copy_stream(source, destination, chunk_size)
-
-        if destination_mode is not None:
-            os.chmod(temporary_path, destination_mode)
-        with _local_versioned_mutation(dst):
-            os.replace(temporary_path, dst)
-    finally:
-        if os.path.exists(temporary_path):
-            os.unlink(temporary_path)
-
-
 def copy_file(src: str, dst: str, chunk_size: int = 131072) -> None:
     """Copy a file between S3, HTTPS, and local storage."""
     if chunk_size <= 0:
@@ -473,7 +453,9 @@ def copy_file(src: str, dst: str, chunk_size: int = 131072) -> None:
     elif dst.startswith(_HTTPS_PREFIX):
         raise NotImplementedError("Only 'rb' mode is supported for https:// paths")
     else:
-        _copy_to_local(src, dst, chunk_size)
+        with _open_copy_source(src) as source:
+            with BinaryFileHandler._write_local(dst) as destination:
+                _copy_stream(source, destination, chunk_size)
 
 
 def move_file(src: str, dst: str) -> None:
@@ -811,30 +793,49 @@ class BinaryFileHandler:
     def _publish_local(cls, file: str, data: str | bytes, expected: str | None) -> str:
         if expected is not None and cls.current_version(file) != expected:
             raise VersionMismatchError(f"File version does not match {expected}")
-        os.makedirs(os.path.dirname(file) or ".", exist_ok=True)
-        if expected is None:
+        if expected is None and isinstance(data, str):
+            os.makedirs(os.path.dirname(file) or ".", exist_ok=True)
             with _local_versioned_mutation(file):
-                if isinstance(data, bytes):
-                    _atomic_write_bytes(os.path.abspath(file), data)
-                else:
-                    with open(file, mode="w", encoding="UTF-8") as output:
-                        output.write(data)
-            return cls.current_version(file)
-        directory = os.path.dirname(file) or "."
-        descriptor, temporary_path = tempfile.mkstemp(dir=directory)
-        try:
-            with os.fdopen(
-                descriptor,
-                mode="wb" if isinstance(data, bytes) else "w",
-                encoding=None if isinstance(data, bytes) else "UTF-8",
-            ) as output:
+                with open(file, mode="w", encoding="UTF-8") as output:
+                    output.write(data)
+        else:
+            with cls._write_local(file, "w" if isinstance(data, str) else "wb") as output:
                 output.write(data)
+        return cls.current_version(file)
+
+    @staticmethod
+    @contextmanager
+    def _write_local(file: str, mode: Literal["w", "wb"] = "wb") -> Generator[IO[Any], None, None]:
+        """Stage an atomic local write using normal creation or existing permissions."""
+        directory = os.path.dirname(file) or "."
+        os.makedirs(directory, exist_ok=True)
+        temporary_path = os.path.join(directory, f".{os.path.basename(file)}.{uuid4().hex}.tmp")
+        destination_mode = stat.S_IMODE(os.stat(file).st_mode) if os.path.exists(file) else None
+        try:
+            descriptor = os.open(
+                temporary_path,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                destination_mode if destination_mode is not None else 0o666,
+            )
+            with os.fdopen(descriptor, mode, encoding=None if mode == "wb" else "UTF-8") as output:
+                yield output
+            if destination_mode is not None:
+                os.chmod(temporary_path, destination_mode)
             with _local_versioned_mutation(file):
                 os.replace(temporary_path, file)
         finally:
             if os.path.exists(temporary_path):
-                os.remove(temporary_path)
-        return cls.current_version(file)
+                os.unlink(temporary_path)
+
+    @staticmethod
+    def capture_version(file: str) -> None:
+        """Capture an existing local state before publishing another representation."""
+        if (
+            not file.startswith((S3_PREFIX, _HTTPS_PREFIX))
+            and _local_history_path(file) is not None
+            and os.path.isfile(file)
+        ):
+            _append_local_version(file, deleted=False)
 
     @classmethod
     def version_metadata(cls, file: str) -> FileVersionMetadata:
@@ -1108,8 +1109,8 @@ class BinaryFileHandler:
 
     def _open_local(self) -> None:
         """Open the existing local stream and manage its history lifecycle."""
-        os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
         if self.mode == "wb":
+            os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
             self._local_mutation = _local_versioned_mutation(self.path)
             self._local_mutation.__enter__()
         try:
@@ -1238,7 +1239,8 @@ class GzipFileHandler:
             raise NotImplementedError(f"mode {mode} is not supported")
         if not 0 <= compression_level <= 9:
             raise ValueError("compression_level must be between 0 and 9")
-        self._binary = BinaryFileHandler(
+        self._binary: BinaryFileHandler | None = None
+        self._binary_factory = lambda: BinaryFileHandler(
             path,
             mode.replace("t", "b"),
             versioned=versioned,
@@ -1253,11 +1255,12 @@ class GzipFileHandler:
     @property
     def version(self) -> str | None:
         """Return the revision read or successfully published by the binary handler."""
-        return self._binary.version
+        return self._binary.version if self._binary is not None else None
 
     def __enter__(self) -> Any:
         """Open gzip after the underlying binary read has completed."""
         with ExitStack() as contexts:
+            self._binary = self._binary_factory()
             source = contexts.enter_context(self._binary)
             stream = contexts.enter_context(
                 gzip.open(source, self._mode, compresslevel=self._compression_level, encoding=self._encoding)

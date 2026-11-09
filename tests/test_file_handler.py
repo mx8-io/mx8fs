@@ -1,11 +1,14 @@
 """Integration tests for typed files, collections and backend-safe lifecycle operations."""
 
 import gzip
+import stat
 from contextlib import nullcontext
 from datetime import UTC, datetime
+from email.message import Message
 from io import BytesIO, UnsupportedOperation
 from pathlib import Path
 from typing import Any, Literal
+from urllib.error import HTTPError, URLError
 
 import pytest
 from botocore.exceptions import ClientError
@@ -413,3 +416,132 @@ def test_legacy_existence_suppresses_permission_errors() -> None:
         stub.add_client_error("head_object", "AccessDenied", expected_params={"Bucket": "bucket", "Key": "record"})
         assert not file_io.file_exists("s3://bucket/record")
         stub.assert_no_pending_responses()
+
+
+def test_plain_and_gzip_storage_share_the_logical_record_lock(tmp_path: Path) -> None:
+    plain = json_file_storage_factory("json", Record)(str(tmp_path))
+    compressed = json_file_storage_factory("json", Record, compression="gzip", fallback_uncompressed=True)(
+        str(tmp_path)
+    )
+    with plain.get_lock("a"):
+        with pytest.raises(TimeoutError):
+            with compressed.get_lock("a", wait_period=0, time_out_seconds=0):
+                pass
+    with compressed.get_lock("a"):
+        with pytest.raises(TimeoutError):
+            with plain.get_lock("a", wait_period=0, time_out_seconds=0):
+                pass
+
+
+@pytest.mark.parametrize("compression", [None, "gzip"])
+@pytest.mark.parametrize("conditional", [False, True])
+def test_storage_publication_preserves_local_creation_and_existing_permissions(
+    tmp_path: Path, compression: Literal["gzip"] | None, conditional: bool
+) -> None:
+    control = tmp_path / "control"
+    control.write_text("normal creation")
+    store = json_file_storage_factory("json", Record, compression=compression)(str(tmp_path))
+    original = store.write(Record(value="original"), "a")
+    destination = tmp_path / ("a.json.gz" if compression else "a.json")
+    assert stat.S_IMODE(destination.stat().st_mode) == stat.S_IMODE(control.stat().st_mode)
+    destination.chmod(0o640)
+    updated = original.model_copy(update={"value": "updated"})
+    if conditional:
+        store.update_if_version(updated, store.read_with_version("a")[1])
+    else:
+        store.update(updated)
+    assert stat.S_IMODE(destination.stat().st_mode) == 0o640
+    assert store.read("a") == updated
+
+
+@pytest.mark.parametrize("reader", ["legacy", "typed", "storage", "binary"])
+def test_missing_reads_do_not_create_parent_directories(tmp_path: Path, reader: str) -> None:
+    root = tmp_path / "missing" / "nested"
+    path = str(root / "a.json")
+    with pytest.raises(FileNotFoundError):
+        if reader == "legacy":
+            file_io.read_file(path)
+        elif reader == "typed":
+            FileHandler(path, dict, compression="gzip", fallback_uncompressed=True).read()
+        elif reader == "storage":
+            json_file_storage_factory("json", Record)(str(root)).read("a")
+        else:
+            with BinaryFileHandler(path) as source:
+                source.read()
+    assert not (tmp_path / "missing").exists()
+
+
+@pytest.mark.parametrize("operation", ["read", "exists"])
+@pytest.mark.parametrize("failed_representation", ["gzip", "plain"])
+@pytest.mark.parametrize("status", [403, 500, None])
+def test_https_failures_are_not_absence_and_legacy_exceptions_remain_compatible(
+    monkeypatch: pytest.MonkeyPatch, operation: str, failed_representation: str, status: int | None
+) -> None:
+    path = "https://example.test/document.txt"
+    failed_url = path + (".gz" if failed_representation == "gzip" else "")
+    requests: list[str] = []
+
+    class Response(BytesIO):
+        status = 200
+
+    def open_url(url: str) -> BytesIO:
+        requests.append(url)
+        if url == failed_url:
+            if status is None:
+                raise URLError("connection failed")
+            raise HTTPError(url, status, "request failed", Message(), None)
+        if url.endswith(".gz"):
+            raise HTTPError(url, 404, "missing", Message(), None)
+        return Response(b"stale plain text")
+
+    monkeypatch.setattr(file_io.urllib.request, "urlopen", open_url)
+    handler = FileHandler(path, str, compression="gzip", fallback_uncompressed=True)
+    with pytest.raises(URLError):
+        getattr(handler, operation)()
+    assert requests == ([path + ".gz"] if failed_representation == "gzip" else [path + ".gz", path])
+    with pytest.raises(FileNotFoundError) as legacy_error:
+        file_io.read_file(failed_url)
+    assert isinstance(legacy_error.value.__cause__, URLError)
+
+
+def test_https_404_allows_plain_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+    path = "https://example.test/document.txt"
+    requests: list[str] = []
+
+    class Response(BytesIO):
+        status = 200
+
+    def open_url(url: str) -> BytesIO:
+        requests.append(url)
+        if url.endswith(".gz"):
+            raise HTTPError(url, 404, "missing", Message(), None)
+        return Response(b"legacy\r\ntext")
+
+    monkeypatch.setattr(file_io.urllib.request, "urlopen", open_url)
+    handler = FileHandler(path, str, compression="gzip", fallback_uncompressed=True)
+    assert handler.read() == "legacy\r\ntext"
+    assert handler.exists()
+    assert requests == [path + ".gz", path, path + ".gz", path]
+
+
+@pytest.mark.parametrize("indexed", [False, True])
+def test_migration_from_untracked_plain_history_recovers_the_newest_model(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, indexed: bool
+) -> None:
+    index = json_index_factory(Record, ["value"], table_name="untracked_migration") if indexed else None
+    monkeypatch.setenv("MX8FS_LOCAL_VERSIONING", "false")
+    plain = json_file_storage_factory("json", Record, index=index)(str(tmp_path))
+    old = plain.write(Record(value="old"), "a")
+    monkeypatch.setenv("MX8FS_LOCAL_VERSIONING", "true")
+    compressed = json_file_storage_factory("json", Record, index=index, compression="gzip", fallback_uncompressed=True)(
+        str(tmp_path)
+    )
+    new = compressed.write(Record(value="new"), "a")
+    metadata = compressed.list_with_metadata(include_deleted=True)[0]
+    assert metadata.latest_readable_version is not None
+    assert compressed.read_version("a", metadata.latest_readable_version.version_id) == new
+    captured_plain = next(v for v in compressed.history("a") if not v.is_deleted and v.version_id.startswith("plain:"))
+    assert compressed.read_version("a", captured_plain.version_id) == old
+    compressed.delete("a")
+    assert compressed.undelete("a") == new
+    assert compressed.read("a") == new

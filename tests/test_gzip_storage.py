@@ -108,6 +108,23 @@ def test_handler_rejects_incompatible_version_options(tmp_path: Path, options: d
         BinaryFileHandler(str(tmp_path / "file"), **options)
 
 
+@pytest.mark.parametrize("versioned", [False, True])
+@pytest.mark.parametrize("existing", [False, True])
+def test_gzip_writer_opens_the_destination_only_on_context_entry(
+    tmp_path: Path, versioned: bool, existing: bool
+) -> None:
+    path = tmp_path / "document.gz"
+    original = gzip.compress(b"original")
+    if existing:
+        path.write_bytes(original)
+    writer = GzipFileHandler(str(path), "wb", versioned=versioned)
+    assert writer.version is None
+    assert path.read_bytes() == original if existing else not path.exists()
+    with writer as output:
+        output.write(b"updated")
+    assert gzip.decompress(path.read_bytes()) == b"updated"
+
+
 def test_gzip_rejects_invalid_level(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="compression_level"):
         GzipFileHandler(str(tmp_path / "file.gz"), compression_level=10)
