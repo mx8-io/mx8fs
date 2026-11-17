@@ -21,12 +21,15 @@ TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR TH
 import json
 import os
 from collections.abc import Callable
+from io import BytesIO
 from pathlib import Path
 from typing import Any
 
 import pytest
+from botocore.stub import Stubber
 
 from mx8fs import ResultsComparer, read_file, write_file
+from mx8fs.file_io import s3_client
 
 
 class Response:
@@ -65,6 +68,31 @@ def fixture_save_dict(save_text: Callable[[str], str]) -> Callable[[Any], str]:
         return save_text(json.dumps(data, indent=4))
 
     return save_dict
+
+
+@pytest.mark.parametrize("content", [[{"value": "array"}], "scalar", 1, None])
+def test_file_comparison_preserves_all_json_value_types(
+    save_dict: Callable[[Any], str], tmp_path: Path, content: Any
+) -> None:
+    source = save_dict(content)
+    correct = str(tmp_path / "expected.json")
+    assert not ResultsComparer(None, create_test_data=True).get_dict_differences(source, correct)
+    assert json.loads(read_file(correct)) == content
+    assert not ResultsComparer(None).get_dict_differences(source, correct)
+
+
+def test_remote_text_comparison_ignores_line_ending_differences() -> None:
+    with Stubber(s3_client) as stub:
+        stub.add_response(
+            "get_object", {"Body": BytesIO(b"first\nsecond"), "ETag": '"test"'}, {"Bucket": "bucket", "Key": "test"}
+        )
+        stub.add_response(
+            "get_object",
+            {"Body": BytesIO(b"first\r\nsecond"), "ETag": '"correct"'},
+            {"Bucket": "bucket", "Key": "correct"},
+        )
+        assert not ResultsComparer(None).get_text_differences("s3://bucket/test", "s3://bucket/correct")
+        stub.assert_no_pending_responses()
 
 
 def test_compare_identical_files(save_dict: Callable[[Any], str]) -> None:

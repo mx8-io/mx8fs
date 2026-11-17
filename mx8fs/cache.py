@@ -26,7 +26,8 @@ from json.decoder import JSONDecodeError
 from time import time
 from typing import Any
 
-from .file_io import BinaryFileHandler, read_file, write_file
+from .file_io import BinaryFileHandler
+from .handler import FileHandler
 
 
 def get_cache_filename(path: str, name: str, extension: str, expiration_seconds: int = 0, **kwargs: dict) -> str:
@@ -207,9 +208,10 @@ def cache_to_disk(
                 **clean_kwargs,
             )
 
+            cache_file = FileHandler(filename, str)
             try:
                 # Try to read the cached result from disk
-                result = read_file(filename)
+                result = cache_file.read()
 
                 _do_logging(
                     log_group, "Cache hit", result, args, clean_kwargs, filename, func, expiration_seconds, level
@@ -221,7 +223,7 @@ def cache_to_disk(
                     log_group, "Cache miss", None, args, clean_kwargs, filename, func, expiration_seconds, level
                 )
                 result = func(*args, **kwargs)
-                write_file(filename, result)
+                cache_file.write(result)
 
             return result
 

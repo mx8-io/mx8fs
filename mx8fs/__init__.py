@@ -21,6 +21,8 @@ from .file_io import (
     FileVersionDeletedError,
     FileVersionMetadata,
     GzipFileHandler,
+    JsonFileHandler,
+    TextFileHandler,
     VersioningNotEnabledError,
     VersioningNotSupportedError,
     VersionMismatchError,
@@ -46,6 +48,7 @@ from .file_io import (
     update_file_if_version_matches,
     write_file,
 )
+from .handler import FileHandler, FileReader
 from .lock import FileLock, Waiter
 from .storage import JsonFileStorage, json_file_storage_factory
 
@@ -111,6 +114,7 @@ def __getattr__(name: str) -> Any:
 __all__ = [
     "BinaryFileHandler",
     "GzipFileHandler",
+    "JsonFileHandler",
     "cache_to_disk_binary",
     "cache_to_disk",
     "copy_file",
@@ -128,6 +132,9 @@ __all__ = [
     "get_folders",
     "json_file_storage_factory",
     "JsonFileStorage",
+    "FileHandler",
+    "FileReader",
+    "TextFileHandler",
     "list_files",
     "list_file_versions",
     "list_files_with_metadata",

@@ -10,6 +10,7 @@ env:
 
 jobs:
   build-and-deploy:
+    name: ci_ok
     runs-on: ubuntu-latest
 
     permissions:

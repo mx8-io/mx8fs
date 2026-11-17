@@ -26,7 +26,7 @@ from logging import getLogger
 from tempfile import NamedTemporaryFile
 from typing import Any
 
-from mx8fs.file_io import read_file, write_file
+from .handler import FileHandler
 
 logger = getLogger("mx8.comparer")
 
@@ -179,15 +179,14 @@ class ResultsComparer:
         differences = Differences()
 
         # Obfuscate the test file content before diffing
-        test_content = read_file(test)
+        test_content = FileHandler(test, str).read()
         obfuscated_test_content = self._obfuscate_text(test_content)
+        correct_file = FileHandler(correct, str)
 
         if self._create_test_data:
-            # make the directory if it doesn't exist
-            os.makedirs(os.path.dirname(correct), exist_ok=True)
-            write_file(correct, obfuscated_test_content)
+            correct_file.write(obfuscated_test_content)
 
-        correct_content = read_file(correct)
+        correct_content = correct_file.read()
 
         if diff := get_diff(correct_content, obfuscated_test_content):
             differences.append({"file": diff})
@@ -197,22 +196,26 @@ class ResultsComparer:
     def get_dict_differences(self, test: str, correct: str) -> Differences:
         """Compare a test file with a correct file."""
         # Load and obfuscate the test file
-        test_dict = json.loads(read_file(test))
+        test_dict = FileHandler(test, object).read()
         obfuscated_test_dict = self._obfuscate_dict(test_dict)
 
+        correct_file = FileHandler(
+            correct,
+            object,
+            encoder=lambda value: json.dumps(value, indent=4, ensure_ascii=False).strip(),
+        )
         self._differences.clear()
         if self._create_test_data:
             try:
-                correct_dict = json.loads(read_file(correct))
+                correct_dict = correct_file.read()
                 self._compare_dicts(correct_dict, obfuscated_test_dict)
                 assert self._differences == [], "The files should be identical"
             except (FileNotFoundError, AssertionError):
                 # Save the obfuscated test file as the correct file
-                os.makedirs(os.path.dirname(correct), exist_ok=True)
-                write_file(correct, json.dumps(obfuscated_test_dict, indent=4, ensure_ascii=False).strip())
+                correct_file.write(obfuscated_test_dict)
                 self._differences.clear()
         else:
-            correct_dict = json.loads(read_file(correct))
+            correct_dict = correct_file.read()
             self._compare_dicts(correct_dict, obfuscated_test_dict)
 
         return self._differences
